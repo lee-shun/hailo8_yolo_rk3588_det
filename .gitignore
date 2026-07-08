@@ -1,0 +1,7 @@
+.clangd/
+.cache/
+.crush/
+build/
+data/
+*.tar.gz
+*.zip
