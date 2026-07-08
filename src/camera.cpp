@@ -4,13 +4,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-
-#ifndef RK_FORMAT_YCbCr_420_SP
-#define RK_FORMAT_YCbCr_420_SP 0x00
-#endif
-#ifndef RK_FORMAT_YUYV_422
-#define RK_FORMAT_YUYV_422 0x0a
-#endif
+#include <rga.h>
 
 Camera::Camera() = default;
 Camera::~Camera() { stop(); }

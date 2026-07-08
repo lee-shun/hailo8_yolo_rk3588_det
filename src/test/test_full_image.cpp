@@ -1,111 +1,144 @@
 /**
- * Test Case 2: 1280x1280 图 -> RGA 预处理 -> Hailo 单张直接推理 (Batch=1)
+ * Test Case 2: 1280x1280 -> RGA 格式转换 -> Hailo 单张直接推理 (Batch=1)
  *
- * 假设模型输入尺寸为 1280x1280。
- * 如果模型输入是 640，请修改 RGA 步骤为 resize 到 640x640。
+ * HailoRT 4.23 API (基于 infer_model.hpp)
  *
- * 编译依赖同上
+ * 编译:
+ *   g++ -std=c++17 test_full_image.cpp -o test_full_image \
+ *       -I/usr/include/hailo -I/usr/include/rga \
+ *       -lopencv_core -lopencv_imgcodecs -lopencv_imgproc \
+ *       -lrga -lhailort -lpthread
  */
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <opencv2/opencv.hpp>
 #include "hailo/hailort.hpp"
-#include "im2d_api.h"
+#include "im2d.h"
+#include <chrono>
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <sys/mman.h>
+#include <vector>
 
 using namespace hailort;
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <model_1280.hef> <image.jpg>" << std::endl;
-        return 1;
-    }
+static std::shared_ptr<uint8_t> page_aligned_alloc(size_t size) {
+  auto addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (addr == MAP_FAILED)
+    throw std::bad_alloc();
+  return std::shared_ptr<uint8_t>(reinterpret_cast<uint8_t *>(addr),
+                                  [size](uint8_t *p) { munmap(p, size); });
+}
 
-    const std::string hef_path = argv[1];
-    const std::string img_path = argv[2];
+int main(int argc, char **argv) {
+  if (argc < 3) {
+    std::cerr << "Usage: " << argv[0] << " <model_1280.hef> <image_1280.jpg>"
+              << std::endl;
+    return 1;
+  }
 
-    // ========== 1. 读取原图 ==========
-    cv::Mat src = cv::imread(img_path);
-    if (src.empty()) {
-        std::cerr << "Failed to load image: " << img_path << std::endl;
-        return 1;
-    }
-    if (src.cols != 1280 || src.rows != 1280) {
-        cv::resize(src, src, cv::Size(1280, 1280));
-    }
+  if (imcheckHeader() != IM_STATUS_SUCCESS) {
+    std::cerr << "RGA header version mismatch!" << std::endl;
+    return 1;
+  }
+  std::cout << "RGA Version: " << querystring(RGA_VERSION) << std::endl;
 
-    // ========== 2. RGA 预处理 (Format Convert: BGR -> RGB) ==========
-    auto t_rga_start = std::chrono::high_resolution_clock::now();
+  const std::string hef_path = argv[1];
+  const std::string img_path = argv[2];
 
-    cv::Mat dst_rgb(1280, 1280, CV_8UC3);
+  // ========== 1. 读取原图 ==========
+  cv::Mat src = cv::imread(img_path);
+  if (src.empty()) {
+    std::cerr << "Failed to load image: " << img_path << std::endl;
+    return 1;
+  }
+  if (src.cols != 1280 || src.rows != 1280) {
+    cv::resize(src, src, cv::Size(1280, 1280));
+  }
 
-    rga_buffer_t src_buf = wrapbuffer_virtualaddr(
-        src.data, src.cols, src.rows, RK_FORMAT_BGR_888);
-    rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-        dst_rgb.data, 1280, 1280, RK_FORMAT_RGB_888);
+  // ========== 2. RGA BGR -> RGB ==========
+  auto t_rga_start = std::chrono::high_resolution_clock::now();
 
-    // 如果模型输入是 1280x1280，只需格式转换
-    // 如果模型输入是 640x640，请改用 imresize() + imcvtcolor()
-    IM_STATUS ret = imcvtcolor(src_buf, dst_buf,
-                               RK_FORMAT_BGR_888, RK_FORMAT_RGB_888);
-    if (ret != IM_STATUS_SUCCESS) {
-        std::cerr << "RGA imcvtcolor failed, fallback to OpenCV" << std::endl;
-        cv::cvtColor(src, dst_rgb, cv::COLOR_BGR2RGB);
-    }
+  cv::Mat dst_rgb(1280, 1280, CV_8UC3);
+  rga_buffer_t src_buf =
+      wrapbuffer_virtualaddr(src.data, 1280, 1280, RK_FORMAT_BGR_888);
+  rga_buffer_t dst_buf =
+      wrapbuffer_virtualaddr(dst_rgb.data, 1280, 1280, RK_FORMAT_RGB_888);
 
-    auto t_rga_end = std::chrono::high_resolution_clock::now();
-    auto rga_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        t_rga_end - t_rga_start).count();
+  IM_STATUS ret =
+      imcvtcolor(src_buf, dst_buf, RK_FORMAT_BGR_888, RK_FORMAT_RGB_888);
+  if (ret != IM_STATUS_SUCCESS) {
+    std::cerr << "imcvtcolor failed: " << imStrError(ret) << std::endl;
+    return 1;
+  }
 
-    // ========== 3. Hailo 单张推理 (Batch=1) ==========
-    auto t_hailo_start = std::chrono::high_resolution_clock::now();
+  auto t_rga_end = std::chrono::high_resolution_clock::now();
+  auto rga_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    t_rga_end - t_rga_start)
+                    .count();
 
-    auto hef = Hef::create(hef_path).expect("Failed to load HEF");
-    auto vdevice = VDevice::create().expect("Failed to create VDevice");
+  // ========== 3. Hailo 单张推理 ==========
+  auto t_hailo_start = std::chrono::high_resolution_clock::now();
 
-    // batch_size = 1 (默认)
-    auto configure_params = vdevice->create_configure_params(hef).value();
-    for (auto& [name, params] : configure_params) {
-        params.batch_size = 1;
-    }
+  auto vdevice = VDevice::create().expect("Failed to create VDevice");
+  auto infer_model = vdevice->create_infer_model(hef_path).expect(
+      "Failed to create infer model");
 
-    auto network_groups = vdevice->configure(hef, configure_params).value();
-    auto network_group = network_groups.at(0);
+  infer_model->set_batch_size(1);
 
-    auto vstream_params = network_group->create_vstream_params();
-    auto input_vstreams = hailort::VStreams::create_input_vstreams(
-        *network_group, vstream_params).value();
-    auto output_vstreams = hailort::VStreams::create_output_vstreams(
-        *network_group, vstream_params).value();
+  auto configured_infer_model =
+      infer_model->configure().expect("Failed to configure");
 
-    // 写入单张图
-    const size_t INPUT_SIZE = 1280 * 1280 * 3;
-    for (auto& input_vstream : input_vstreams) {
-        input_vstream.write(MemoryView(dst_rgb.data, INPUT_SIZE));
-    }
+  auto bindings = configured_infer_model.create_bindings().expect(
+      "Failed to create bindings");
 
-    // 读取结果
-    const size_t output_frame_size = output_vstreams[0].get_frame_size();
-    std::vector<uint8_t> output_buffer(output_frame_size);
-    for (auto& output_vstream : output_vstreams) {
-        output_vstream.read(MemoryView(output_buffer.data(), output_buffer.size()));
-    }
+  const auto &input_streams = infer_model->inputs();
+  const auto &output_streams = infer_model->outputs();
 
-    auto t_hailo_end = std::chrono::high_resolution_clock::now();
-    auto hailo_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        t_hailo_end - t_hailo_start).count();
+  // 设置输入
+  if (!input_streams.empty()) {
+    size_t input_size = input_streams[0].get_frame_size();
+    auto input_binding =
+        bindings.input(input_streams[0].name()).expect("input binding failed");
+    input_binding.set_buffer(MemoryView(dst_rgb.data, input_size));
+  }
 
-    // ========== 4. 后处理 ==========
-    // 直接解析 output_buffer，检测框坐标即原图坐标，无需映射。
+  // 设置输出（页对齐）
+  std::vector<std::shared_ptr<uint8_t>> output_buffers;
+  for (const auto &s : output_streams) {
+    size_t output_size = s.get_frame_size();
+    auto buf = page_aligned_alloc(output_size);
+    output_buffers.push_back(buf);
+    auto output_binding =
+        bindings.output(s.name()).expect("output binding failed");
+    output_binding.set_buffer(MemoryView(buf.get(), output_size));
+  }
 
-    std::cout << "\n========== Test Case 2: Full Image Direct ==========" << std::endl;
-    std::cout << "RGA convert time:          " << rga_us << " us ("
-              << rga_us / 1000.0 << " ms)" << std::endl;
-    std::cout << "Hailo inference time:      " << hailo_us << " us ("
-              << hailo_us / 1000.0 << " ms)" << std::endl;
-    std::cout << "End-to-end latency:        " << (rga_us + hailo_us)
-              << " us (" << (rga_us + hailo_us) / 1000.0 << " ms)" << std::endl;
-    std::cout << "Note: Single frame, no batch waiting" << std::endl;
+  hailo_status status = configured_infer_model.activate();
+  if (status != HAILO_SUCCESS) {
+    std::cerr << "Failed to activate: " << status << std::endl;
+    return 1;
+  }
 
-    return 0;
+  status =
+      configured_infer_model.run(bindings, std::chrono::milliseconds(1000));
+  if (status != HAILO_SUCCESS) {
+    std::cerr << "Inference failed: " << status << std::endl;
+    return 1;
+  }
+
+  auto t_hailo_end = std::chrono::high_resolution_clock::now();
+  auto hailo_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                      t_hailo_end - t_hailo_start)
+                      .count();
+
+  // ========== 4. 后处理 ==========
+  std::cout << "\n========== Test Case 2: Full Image Direct =========="
+            << std::endl;
+  std::cout << "RGA convert:      " << rga_us << " us (" << rga_us / 1000.0
+            << " ms)" << std::endl;
+  std::cout << "Hailo inference:  " << hailo_us << " us (" << hailo_us / 1000.0
+            << " ms)" << std::endl;
+  std::cout << "End-to-end:       " << (rga_us + hailo_us) << " us ("
+            << (rga_us + hailo_us) / 1000.0 << " ms)" << std::endl;
+
+  return 0;
 }
