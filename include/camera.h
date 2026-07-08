@@ -28,30 +28,34 @@ public:
     void release();
 
     uint8_t* src_ptr() const;
-    int src_stride() const;
+    int src_stride() const;      // hor_stride（预计算，可靠）
+    int src_ver_stride() const;  // ver_stride（预计算，可靠）
     int src_w() const;
     int src_h() const;
     int src_fmt() const;
 
+    int src_fd() const;
+
 private:
     int fd_ = -1;
     int width_ = 0, height_ = 0;
+    int hor_stride_ = 0, ver_stride_ = 0;  // MPP 对齐后的 stride（新增）
     CameraFormat fmt_ = CameraFormat::YUYV;
     bool streaming_ = false;
 
-    struct V4L2Buf { void* start; size_t len; };
+    struct V4L2Buf { void* start; size_t len; int fd; };
     std::vector<V4L2Buf> v4l2_bufs_;
     int v4l2_buf_idx_ = -1;
 
     MppCtx mpp_ctx_ = nullptr;
     MppApi* mpp_api_ = nullptr;
-    MppFrame mpp_frame_ = nullptr;   // decoder 返回的 frame 指针（advanced 下等于 out_frame_）
+    MppFrame mpp_frame_ = nullptr;
 
-    // MJPEG advanced 解码预分配资源（严格对应 mpi_dec_test 的 dec_advanced）
-    MppFrame out_frame_ = nullptr;   // 预分配的输出 frame
-    MppBuffer frm_buf_ = nullptr;    // 预分配的输出 buffer
+    MppFrame out_frame_ = nullptr;
+    MppBuffer frm_buf_ = nullptr;
     MppBufferGroup frm_grp_ = nullptr;
     MppBufferGroup pkt_grp_ = nullptr;
+    MppBufferGroup pkt_grp_ext_ = nullptr;
 
     bool init_v4l2(int fps);
     bool init_mpp();

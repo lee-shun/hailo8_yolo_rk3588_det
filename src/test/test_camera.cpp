@@ -4,50 +4,78 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <unistd.h>
 #include <utility_tool/step_timer.h>
 
-// 保存原始 NV12 数据为文件，可用 ffplay 播放验证：
-// ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 frame_0.yuv
-static void save_yuv(const std::string &filename, uint8_t *ptr, int w, int h,
-                     int stride) {
-  // NV12: Y 平面 stride*h 字节，UV 平面 stride*h/2 字节
-  int y_size = stride * h;
-  int uv_size = stride * h / 2;
-
-  std::ofstream ofs(filename, std::ios::binary);
-  if (!ofs) {
-    std::cerr << "Failed to open " << filename << "\n";
-    return;
+// NV12 -> BGR，正确处理 MPP 的 hor_stride/ver_stride 对齐
+// 使用 OpenCV Mat 的 ptr(row) 访问，自动处理 Mat 内部 step 对齐
+static cv::Mat nv12_to_bgr(uint8_t *ptr, int w, int h, int hor_stride,
+                           int ver_stride) {
+  // 只有当 hor_stride == w 且 ver_stride == h 时，才是真正的紧凑 NV12
+  if (hor_stride == w && ver_stride == h) {
+    cv::Mat nv12(h * 3 / 2, w, CV_8UC1, ptr);
+    cv::Mat bgr;
+    cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+    return bgr;
   }
-  ofs.write((char *)ptr, y_size + uv_size);
-  std::cout << "Saved " << filename << " (" << (y_size + uv_size)
-            << " bytes)\n";
+
+  // 有 padding，拷贝到连续 buffer
+  cv::Mat nv12(h * 3 / 2, w, CV_8UC1);
+  int y_rows = h;
+  int uv_rows = h / 2;
+
+  // 拷贝 Y 平面：只取前 h 行有效数据
+  for (int i = 0; i < y_rows; ++i)
+    memcpy(nv12.ptr(i), ptr + (size_t)i * hor_stride, w);
+
+  // 拷贝 UV 平面：从 hor_stride * ver_stride 偏移处开始（MPP 对齐后的物理布局）
+  uint8_t *uv_src = ptr + (size_t)hor_stride * ver_stride;
+  for (int i = 0; i < uv_rows; ++i)
+    memcpy(nv12.ptr(h + i), uv_src + (size_t)i * hor_stride, w);
+
+  cv::Mat bgr;
+  cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+  return bgr;
 }
 
-// 简单验证 NV12 数据合理性（Y 平面值应在 0-255 之间，通常不会全 0 或全 255）
-static bool sanity_check_nv12(uint8_t *ptr, int w, int h, int stride) {
-  if (!ptr)
-    return false;
-  int y_size = stride * h;
-  int zeros = 0, valid = 0;
-  for (int i = 0; i < y_size; i += 100) { // 采样检查
-    if (ptr[i] == 0)
-      zeros++;
-    else
-      valid++;
-  }
-  std::cout << "  Sanity check: sampled " << (zeros + valid)
-            << " pixels, zeros=" << zeros << "\n";
-  return valid > 0; // 至少有一些非零值
+// YUYV -> BGR
+static cv::Mat yuyv_to_bgr(uint8_t *ptr, int w, int h) {
+  cv::Mat yuyv(h, w, CV_8UC2, ptr);
+  cv::Mat bgr;
+  cv::cvtColor(yuyv, bgr, cv::COLOR_YUV2BGR_YUYV);
+  return bgr;
 }
 
 int main(int argc, char **argv) {
-  std::string dev = (argc > 1) ? argv[1] : "/dev/video0";
-  int width = (argc > 2) ? std::stoi(argv[2]) : 1920;
-  int height = (argc > 3) ? std::stoi(argv[3]) : 1080;
-  int fps = (argc > 4) ? std::stoi(argv[4]) : 30;
-  CameraFormat fmt = CameraFormat::MJPEG;
+  std::string dev = "/dev/video0";
+  int width = 1920, height = 1080, fps = 30;
+  bool useMjpeg = false;
 
+  int opt;
+  while ((opt = getopt(argc, argv, "m")) != -1) {
+    switch (opt) {
+    case 'm':
+      useMjpeg = true;
+      break;
+    default:
+      std::cerr << "Usage: " << argv[0]
+                << " [-m] [device] [width] [height] [fps]\n";
+      return 1;
+    }
+  }
+
+  if (argc - optind >= 1)
+    dev = argv[optind];
+  if (argc - optind >= 2)
+    width = std::stoi(argv[optind + 1]);
+  if (argc - optind >= 3)
+    height = std::stoi(argv[optind + 2]);
+  if (argc - optind >= 4)
+    fps = std::stoi(argv[optind + 3]);
+
+  CameraFormat fmt = useMjpeg ? CameraFormat::MJPEG : CameraFormat::YUYV;
   std::cout << "=== Camera Test ===\n";
   std::cout << "Device: " << dev << "\n";
   std::cout << "Resolution: " << width << "x" << height << " @ " << fps
@@ -66,16 +94,13 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  const int total_frames = 300; // 抓 30 帧
+  const int total_frames = 300;
   int ok_frames = 0;
   auto t_start = std::chrono::steady_clock::now();
-
 
   TIMER_TEST_BEGIN(mjpg_cam_test);
 
   for (int i = 0; i < total_frames; i++) {
-    std::cout << "\n--- Frame " << i << " ---\n";
-
     TIMER_STEP_START(mjpg_cam_test, grab);
     if (!cam.grab()) {
       std::cerr << "  grab() failed, skip\n";
@@ -86,8 +111,8 @@ int main(int argc, char **argv) {
     uint8_t *ptr = cam.src_ptr();
     int w = cam.src_w();
     int h = cam.src_h();
-    int stride = cam.src_stride();
-    int rga_fmt = cam.src_fmt();
+    int hor_stride = cam.src_stride();
+    int ver_stride = cam.src_ver_stride();
 
     if (!ptr) {
       std::cerr << "  src_ptr() is null\n";
@@ -95,28 +120,18 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    std::cout << "  Output: " << w << "x" << h << " stride=" << stride
-              << " rga_fmt=" << rga_fmt << "\n";
-
-    // 打印前 16 字节（Y 平面开头）
-    std::cout << "  Y-plane first 16 bytes: ";
-    for (int j = 0; j < 16 && j < stride; j++) {
-      std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)ptr[j]
-                << " ";
-    }
-    std::cout << std::dec << "\n";
-
-    // 数据合理性检查
+    cv::Mat bgr;
     if (fmt == CameraFormat::MJPEG) {
-      if (!sanity_check_nv12(ptr, w, h, stride)) {
-        std::cerr << "  Warning: NV12 sanity check failed\n";
-      }
+      bgr = nv12_to_bgr(ptr, w, h, hor_stride, ver_stride);
+    } else {
+      bgr = yuyv_to_bgr(ptr, w, h);
     }
 
-    // 保存第 0 帧和第 15 帧为文件，方便外部验证
-    if (i == 0 || i == 15) {
-      std::string fname = "frame_" + std::to_string(i) + ".yuv";
-      save_yuv(fname, ptr, w, h, stride);
+    if (i % 30 == 0) {
+      std::cout << "Frame " << i << " " << w << "x" << h
+                << " hor_stride=" << hor_stride << " ver_stride=" << ver_stride
+                << "\n";
+      cv::imwrite(std::to_string(i) + "_Camera.png", bgr);
     }
 
     cam.release();
@@ -135,6 +150,7 @@ int main(int argc, char **argv) {
   std::cout << "Elapsed: " << elapsed << "s\n";
   std::cout << "Actual FPS: " << actual_fps << "\n";
 
+  cv::destroyAllWindows();
   cam.stop();
   return 0;
 }

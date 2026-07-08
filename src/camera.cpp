@@ -106,6 +106,7 @@ bool Camera::init_v4l2(int fps) {
       CAM_ERR("mmap failed on buf " << i);
       return false;
     }
+
     if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
       CAM_ERR("VIDIOC_QBUF failed on buf " << i);
       return false;
@@ -117,134 +118,127 @@ bool Camera::init_v4l2(int fps) {
 bool Camera::init_mpp() {
   CAM_LOG("MPP init start...");
 
-  RK_U32 hor_stride = MPP_ALIGN(width_, 16);
-  RK_U32 ver_stride = MPP_ALIGN(height_, 16);
-  RK_U32 buf_size = hor_stride * ver_stride * 4;
+  hor_stride_ = MPP_ALIGN(width_, 16);
+  ver_stride_ = MPP_ALIGN(height_, 16);
+  RK_U32 buf_size = (RK_U32)hor_stride_ * ver_stride_ * 4;
 
   CAM_LOG("Prealloc output: " << width_ << "x" << height_
-                              << " stride=" << hor_stride << "x" << ver_stride
+                              << " stride=" << hor_stride_ << "x" << ver_stride_
                               << " buf_size=" << buf_size);
 
-  // 1. 初始化输出 frame
-  if (mpp_frame_init(&out_frame_) != MPP_OK) {
-    CAM_ERR("mpp_frame_init failed");
-    return false;
-  }
-
-  // 2. 创建 INTERNAL buffer group（官方 dec_buf_mgr_setup 的等效做法）
-  // 注意：只有 INTERNAL 模式才支持 mpp_buffer_group_limit_config
+  MppDecCfg cfg = nullptr;
   MppBufferType buf_type = MPP_BUFFER_TYPE_ION;
-  if (mpp_buffer_group_get(&frm_grp_, buf_type, MPP_BUFFER_INTERNAL, "cam_frm",
-                           __FUNCTION__) != MPP_OK) {
-    CAM_ERR("mpp_buffer_group_get(ION, INTERNAL) failed, try NORMAL");
-    buf_type = MPP_BUFFER_TYPE_NORMAL;
+  bool ok = false;
+
+  do {
+    if (mpp_frame_init(&out_frame_) != MPP_OK) {
+      CAM_ERR("mpp_frame_init failed");
+      break;
+    }
+
+    mpp_frame_set_width(out_frame_, width_);
+    mpp_frame_set_height(out_frame_, height_);
+    mpp_frame_set_hor_stride(out_frame_, hor_stride_);
+    mpp_frame_set_ver_stride(out_frame_, ver_stride_);
+    mpp_frame_set_fmt(out_frame_, MPP_FMT_YUV420SP);
+
     if (mpp_buffer_group_get(&frm_grp_, buf_type, MPP_BUFFER_INTERNAL,
                              "cam_frm", __FUNCTION__) != MPP_OK) {
-      CAM_ERR("mpp_buffer_group_get(NORMAL, INTERNAL) also failed");
-      // goto FAIL_FRAME;
-    return false;
+      buf_type = MPP_BUFFER_TYPE_NORMAL;
+      if (mpp_buffer_group_get(&frm_grp_, buf_type, MPP_BUFFER_INTERNAL,
+                               "cam_frm", __FUNCTION__) != MPP_OK) {
+        CAM_ERR("mpp_buffer_group_get(frm, INTERNAL) failed");
+        break;
+      }
     }
-  }
-  CAM_LOG("Buffer group type=" << (buf_type == MPP_BUFFER_TYPE_ION ? "ION"
-                                                                   : "NORMAL"));
+    CAM_LOG("Buffer group type=" << (buf_type == MPP_BUFFER_TYPE_ION ? "ION"
+                                                                       : "NORMAL"));
 
-  // 3. 限制 group 容量（仅 INTERNAL 支持）
-  if (mpp_buffer_group_limit_config(frm_grp_, buf_size, 4) != MPP_OK) {
-    CAM_ERR("mpp_buffer_group_limit_config failed");
-    // goto FAIL_GROUP;
-    return false;
-  }
-
-  // 4. 分配输出 buffer
-  if (mpp_buffer_get(frm_grp_, &frm_buf_, buf_size) != MPP_OK) {
-    CAM_ERR("mpp_buffer_get(frm_buf) failed");
-    // goto FAIL_GROUP;
-    return false;
-  }
-  CAM_LOG("frm_buf allocated: " << mpp_buffer_get_size(frm_buf_)
-                                << " ptr=" << mpp_buffer_get_ptr(frm_buf_));
-
-  // 5. 绑定到 frame
-  mpp_frame_set_buffer(out_frame_, frm_buf_);
-
-  // 6. 创建解码器
-  if (mpp_create(&mpp_ctx_, &mpp_api_) != MPP_OK) {
-    CAM_ERR("mpp_create failed");
-    // goto FAIL_BUF;
-    return false;
-  }
-  if (mpp_init(mpp_ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingMJPEG) != MPP_OK) {
-    CAM_ERR("mpp_init failed");
-    // goto FAIL_CTX;
-    return false;
-  }
-
-  // 7. 设置输出格式（jpeg 解码前必须完成，与官方一致）
-  MppFrameFormat out_fmt = MPP_FMT_YUV420SP;
-  if (mpp_api_->control(mpp_ctx_, MPP_DEC_SET_OUTPUT_FORMAT, &out_fmt) !=
-      MPP_OK) {
-    CAM_ERR("MPP_DEC_SET_OUTPUT_FORMAT failed");
-    return false;
-  }
-
-  // 8. 配置 split_parse = 1
-  MppDecCfg cfg = nullptr;
-  mpp_dec_cfg_init(&cfg);
-  if (mpp_api_->control(mpp_ctx_, MPP_DEC_GET_CFG, cfg) != MPP_OK) {
-    CAM_ERR("MPP_DEC_GET_CFG failed");
-    mpp_dec_cfg_deinit(cfg);
-    goto FAIL_CTX;
-  }
-  if (mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1) != MPP_OK) {
-    CAM_ERR("mpp_dec_cfg_set_u32 failed");
-    mpp_dec_cfg_deinit(cfg);
-    goto FAIL_CTX;
-  }
-  if (mpp_api_->control(mpp_ctx_, MPP_DEC_SET_CFG, cfg) != MPP_OK) {
-    CAM_ERR("MPP_DEC_SET_CFG failed");
-    mpp_dec_cfg_deinit(cfg);
-    goto FAIL_CTX;
-  }
-  mpp_dec_cfg_deinit(cfg);
-
-  // 9. 创建输入 packet buffer group（INTERNAL 模式）
-  if (mpp_buffer_group_get(&pkt_grp_, MPP_BUFFER_TYPE_ION, MPP_BUFFER_INTERNAL,
-                           "cam_pkt", __FUNCTION__) != MPP_OK) {
-    CAM_ERR("mpp_buffer_group_get(pkt, ION, INTERNAL) failed, try NORMAL");
-    if (mpp_buffer_group_get(&pkt_grp_, MPP_BUFFER_TYPE_NORMAL,
-                             MPP_BUFFER_INTERNAL, "cam_pkt",
-                             __FUNCTION__) != MPP_OK) {
-      CAM_ERR("mpp_buffer_group_get(pkt, NORMAL, INTERNAL) also failed");
-      goto FAIL_CTX;
+    if (mpp_buffer_group_limit_config(frm_grp_, buf_size, 4) != MPP_OK) {
+      CAM_ERR("mpp_buffer_group_limit_config failed");
+      break;
     }
+
+    if (mpp_buffer_get(frm_grp_, &frm_buf_, buf_size) != MPP_OK) {
+      CAM_ERR("mpp_buffer_get(frm_buf) failed");
+      break;
+    }
+    CAM_LOG("frm_buf allocated: " << mpp_buffer_get_size(frm_buf_)
+                                  << " ptr=" << mpp_buffer_get_ptr(frm_buf_));
+
+    mpp_frame_set_buffer(out_frame_, frm_buf_);
+
+    if (mpp_create(&mpp_ctx_, &mpp_api_) != MPP_OK) {
+      CAM_ERR("mpp_create failed");
+      break;
+    }
+    if (mpp_init(mpp_ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingMJPEG) != MPP_OK) {
+      CAM_ERR("mpp_init failed");
+      break;
+    }
+
+    MppFrameFormat out_fmt = MPP_FMT_YUV420SP;
+    if (mpp_api_->control(mpp_ctx_, MPP_DEC_SET_OUTPUT_FORMAT, &out_fmt) !=
+        MPP_OK) {
+      CAM_ERR("MPP_DEC_SET_OUTPUT_FORMAT failed");
+      break;
+    }
+
+    mpp_dec_cfg_init(&cfg);
+    if (mpp_api_->control(mpp_ctx_, MPP_DEC_GET_CFG, cfg) != MPP_OK) {
+      CAM_ERR("MPP_DEC_GET_CFG failed");
+      break;
+    }
+    if (mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1) != MPP_OK) {
+      CAM_ERR("mpp_dec_cfg_set_u32 failed");
+      break;
+    }
+    if (mpp_api_->control(mpp_ctx_, MPP_DEC_SET_CFG, cfg) != MPP_OK) {
+      CAM_ERR("MPP_DEC_SET_CFG failed");
+      break;
+    }
+
+    if (mpp_buffer_group_get(&pkt_grp_, MPP_BUFFER_TYPE_ION, MPP_BUFFER_INTERNAL,
+                             "cam_pkt", __FUNCTION__) != MPP_OK) {
+      if (mpp_buffer_group_get(&pkt_grp_, MPP_BUFFER_TYPE_NORMAL,
+                               MPP_BUFFER_INTERNAL, "cam_pkt",
+                               __FUNCTION__) != MPP_OK) {
+        CAM_ERR("mpp_buffer_group_get(pkt, INTERNAL) failed");
+        break;
+      }
+    }
+
+    ok = true;
+  } while (0);
+
+  if (cfg) {
+    mpp_dec_cfg_deinit(cfg);
+    cfg = nullptr;
+  }
+
+  if (!ok) {
+    if (mpp_ctx_) {
+      mpp_destroy(mpp_ctx_);
+      mpp_ctx_ = nullptr;
+      mpp_api_ = nullptr;
+    }
+    if (frm_buf_) {
+      mpp_buffer_put(frm_buf_);
+      frm_buf_ = nullptr;
+    }
+    if (frm_grp_) {
+      mpp_buffer_group_put(frm_grp_);
+      frm_grp_ = nullptr;
+    }
+    if (out_frame_) {
+      mpp_frame_deinit(&out_frame_);
+      out_frame_ = nullptr;
+    }
+    return false;
   }
 
   CAM_LOG("MPP init OK");
   return true;
-
-  // 错误处理：按依赖反向释放
-FAIL_CTX:
-  if (mpp_ctx_) {
-    mpp_destroy(mpp_ctx_);
-    mpp_ctx_ = nullptr;
-    mpp_api_ = nullptr;
-  }
-FAIL_BUF:
-  if (frm_buf_) {
-    mpp_buffer_put(frm_buf_);
-    frm_buf_ = nullptr;
-  }
-FAIL_GROUP:
-  if (frm_grp_) {
-    mpp_buffer_group_put(frm_grp_);
-    frm_grp_ = nullptr;
-  }
-FAIL_FRAME:
-  if (out_frame_) {
-    mpp_frame_deinit(&out_frame_);
-    out_frame_ = nullptr;
-  }
-  return false;
 }
 
 bool Camera::start() {
@@ -272,6 +266,8 @@ void Camera::stop() {
   for (auto &b : v4l2_bufs_) {
     if (b.start && b.start != MAP_FAILED)
       munmap(b.start, b.len);
+    if (b.fd >= 0)
+      close(b.fd);
   }
   v4l2_bufs_.clear();
   close(fd_);
@@ -305,6 +301,9 @@ void Camera::stop() {
     mpp_buffer_group_put(pkt_grp_);
     pkt_grp_ = nullptr;
   }
+
+  hor_stride_ = 0;
+  ver_stride_ = 0;
 
   CAM_LOG("Stopped");
 }
@@ -358,10 +357,6 @@ bool Camera::grab() {
       goto err_qbuf;
     }
 
-    // ============================================================
-    // 严格遵循 mpi_dec_test 的 dec_advanced 流程
-    // 所有变量先声明（无初始化器），后赋值，避免 goto 跨越初始化
-    // ============================================================
     MppBuffer pkt_buf;
     MppPacket packet;
     MppFrame frame_ret;
@@ -377,18 +372,15 @@ bool Camera::grab() {
     meta = nullptr;
     ret = MPP_OK;
 
-    // 1. 从 packet group 分配 DMA buffer
+    // 旧版 MPP 没有 mpp_buffer_import_with_fd，使用 memcpy 路径
     ret = mpp_buffer_get(pkt_grp_, &pkt_buf, buf.bytesused);
     if (ret != MPP_OK) {
       CAM_ERR("mpp_buffer_get(pkt_buf) failed, ret=" << ret);
       goto err_qbuf;
     }
-
-    // 2. 拷贝 V4L2 MJPEG 数据到 MPP buffer
     memcpy(mpp_buffer_get_ptr(pkt_buf), v4l2_bufs_[buf.index].start,
            buf.bytesused);
 
-    // 3. 用 buffer 初始化 packet
     ret = mpp_packet_init_with_buffer(&packet, pkt_buf);
     if (ret != MPP_OK) {
       CAM_ERR("mpp_packet_init_with_buffer failed, ret=" << ret);
@@ -396,7 +388,10 @@ bool Camera::grab() {
       goto err_qbuf;
     }
 
-    // 4. 将预分配的输出 frame 绑定到 packet meta
+    mpp_packet_set_size(packet, buf.bytesused);
+    mpp_packet_set_length(packet, buf.bytesused);
+    mpp_packet_set_pos(packet, mpp_packet_get_data(packet));
+
     meta = mpp_packet_get_meta(packet);
     if (meta) {
       mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, out_frame_);
@@ -405,7 +400,6 @@ bool Camera::grab() {
       CAM_ERR("mpp_packet_get_meta returned null");
     }
 
-    // 5. 发送 packet 到 decoder
     ret = mpp_api_->decode_put_packet(mpp_ctx_, packet);
     if (ret != MPP_OK) {
       CAM_ERR("decode_put_packet failed, ret=" << ret);
@@ -413,14 +407,12 @@ bool Camera::grab() {
     }
     CAM_LOG("decode_put_packet OK");
 
-    // 6. 同步获取解码后的 frame
     ret = mpp_api_->decode_get_frame(mpp_ctx_, &frame_ret);
     if (ret != MPP_OK || !frame_ret) {
       CAM_ERR("decode_get_frame failed, ret=" << ret << " frame=" << frame_ret);
       goto done;
     }
 
-    // 7. 检查返回的 frame 是否与预分配的 frame 一致
     if (frame_ret != out_frame_) {
       CAM_ERR("frame mismatch: expected " << out_frame_ << " got "
                                           << frame_ret);
@@ -428,16 +420,13 @@ bool Camera::grab() {
       CAM_LOG("frame match OK");
     }
 
-    // 8. 获取解码信息
     out_w = mpp_frame_get_width(frame_ret);
     out_h = mpp_frame_get_height(frame_ret);
     out_stride = mpp_frame_get_hor_stride(frame_ret);
     CAM_LOG("Decoded: " << out_w << "x" << out_h << " stride=" << out_stride);
 
-    // 9. 保存 frame 指针，供 src_ptr() 等接口使用
     mpp_frame_ = frame_ret;
 
-    // 10. 从 frame meta 中获取 input packet，确认 MPP 已完成处理
     meta = mpp_frame_get_meta(frame_ret);
     if (meta) {
       MppPacket packet_ret;
@@ -454,28 +443,21 @@ bool Camera::grab() {
       }
     }
 
-    // 11. 检查 eos（单帧 MJPEG 通常不会触发）
     if (mpp_frame_get_eos(frame_ret)) {
       CAM_LOG("found eos frame");
     }
 
   done:
-    // 12. 释放 packet 结构体
-    if (packet) {
+    if (packet)
       mpp_packet_deinit(&packet);
-    }
-    // 13. 释放 packet buffer（对应 mpp_buffer_get 的引用）
-    if (pkt_buf) {
+    if (pkt_buf)
       mpp_buffer_put(pkt_buf);
-    }
 
     if (ret != MPP_OK || !mpp_frame_) {
-      // 解码失败，确保不保留无效指针
       mpp_frame_ = nullptr;
       goto err_qbuf;
     }
 
-    // 14. MJPEG 数据已拷贝到 MPP 内部 buffer，V4L2 buffer 可以立即归还
     struct v4l2_buffer qbuf{};
     qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     qbuf.memory = V4L2_MEMORY_MMAP;
@@ -529,11 +511,11 @@ uint8_t *Camera::src_ptr() const {
 }
 
 int Camera::src_stride() const {
-  if (fmt_ == CameraFormat::MJPEG) {
-    return mpp_frame_ ? mpp_frame_get_hor_stride(mpp_frame_) : 0;
-  } else {
-    return width_ * 2;
-  }
+  return hor_stride_;
+}
+
+int Camera::src_ver_stride() const {
+  return ver_stride_;
 }
 
 int Camera::src_w() const { return width_; }
@@ -544,4 +526,11 @@ int Camera::src_fmt() const {
     return RK_FORMAT_YCbCr_420_SP;
   else
     return RK_FORMAT_YUYV_422;
+}
+
+int Camera::src_fd() const {
+  if (fmt_ == CameraFormat::MJPEG && frm_buf_) {
+    return mpp_buffer_get_fd(frm_buf_);
+  }
+  return -1;
 }
