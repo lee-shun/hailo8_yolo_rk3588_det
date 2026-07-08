@@ -131,7 +131,9 @@ int main(int argc, char **argv) {
       std::cout << "Frame " << i << " " << w << "x" << h
                 << " hor_stride=" << hor_stride << " ver_stride=" << ver_stride
                 << "\n";
-      cv::imwrite(std::to_string(i) + "_Camera.png", bgr);
+      std::string front = (fmt == CameraFormat::MJPEG) ? "MJPG" : "YUV";
+      TIMER_TEST_PEEK(mjpg_cam_test);
+      cv::imwrite(front + "_" + std::to_string(i) + "_camera.png", bgr);
     }
 
     cam.release();
