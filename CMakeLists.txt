@@ -200,6 +200,15 @@ if(HAILO_RT_FOUND
                         ${MPP_LIBRARY} ${RGA_LIBRARY})
   target_compile_options(roi_detect_hailo_main PRIVATE ${OpenMP_CXX_FLAGS})
   message(STATUS "Target roi_detect_hailo_main: ENABLED")
+
+  # test
+  add_executable(test_full_image ./src/test/test_full_image.cpp)
+  target_link_libraries(test_full_image ${COMMON_LIBS} ${HAILO_RT_LIB}
+                        ${MPP_LIBRARY} ${RGA_LIBRARY})
+
+  add_executable(test_tiling_batch ./src/test/test_tiling_batch.cpp)
+  target_link_libraries(test_tiling_batch ${COMMON_LIBS} ${HAILO_RT_LIB}
+                        ${MPP_LIBRARY} ${RGA_LIBRARY})
 else()
   message(
     STATUS "Target roi_detect_hailo_main: DISABLED (missing dependencies)")

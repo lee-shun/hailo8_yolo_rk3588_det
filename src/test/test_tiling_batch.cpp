@@ -18,7 +18,7 @@
 #include <chrono>
 #include <opencv2/opencv.hpp>
 #include "hailo/hailort.hpp"
-#include "im2d_api.h"
+#include "im2d.h"
 
 using namespace hailort;
 
