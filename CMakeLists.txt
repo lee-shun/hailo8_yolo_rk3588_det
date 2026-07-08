@@ -75,7 +75,7 @@ endif()
 find_path(
   RGA_INCLUDE_DIR
   NAMES im2d.hpp
-  PATHS /usr/include /usr/local/include/rga)
+  PATHS /usr/include/rga /usr/local/include/rga)
 if(NOT RGA_INCLUDE_DIR)
   find_path(
     RGA_INCLUDE_DIR
@@ -100,7 +100,7 @@ endif()
 find_library(
   MPP_LIBRARY
   NAMES rockchip_mpp
-  PATHS /usr/lib /usr/local/lib /usr/lib/aarch64-linux-gnu)
+  PATHS /usr/local/lib /usr/lib /usr/lib/aarch64-linux-gnu)
 if(NOT MPP_LIBRARY)
   message(STATUS "System rockchip_mpp not found, falling back to 3rdparty")
   find_library(
@@ -113,7 +113,7 @@ endif()
 find_path(
   MPP_INCLUDE_DIR
   NAMES rockchip/mpp_frame.h
-  PATHS /usr/include /usr/local/include)
+  PATHS /usr/local/include /usr/include)
 if(NOT MPP_INCLUDE_DIR)
   find_path(
     MPP_INCLUDE_DIR
@@ -195,9 +195,13 @@ set(SOURCES src/camera.cpp src/rga_engine.cpp src/yolo_detector.cpp
 if(HAILO_RT_FOUND
    AND MPP_FOUND
    AND RGA_FOUND)
-  add_executable(roi_detect_hailo_main src/main.cpp ${SOURCES})
-  target_link_libraries(roi_detect_hailo_main ${COMMON_LIBS} ${HAILO_RT_LIB}
+  add_library(${PROJECT_NAME} ${SOURCES})
+  target_link_libraries(${PROJECT_NAME} ${COMMON_LIBS} ${HAILO_RT_LIB}
                         ${MPP_LIBRARY} ${RGA_LIBRARY})
+
+  add_executable(roi_detect_hailo_main src/main.cpp)
+  target_link_libraries(roi_detect_hailo_main ${PROJECT_NAME})
+
   target_compile_options(roi_detect_hailo_main PRIVATE ${OpenMP_CXX_FLAGS})
   message(STATUS "Target roi_detect_hailo_main: ENABLED")
 
@@ -209,6 +213,9 @@ if(HAILO_RT_FOUND
   add_executable(test_tiling_batch ./src/test/test_tiling_batch.cpp)
   target_link_libraries(test_tiling_batch ${COMMON_LIBS} ${HAILO_RT_LIB}
                         ${MPP_LIBRARY} ${RGA_LIBRARY})
+
+  add_executable(test_camera ./src/test/test_camera.cpp)
+  target_link_libraries(test_camera ${PROJECT_NAME})
 else()
   message(
     STATUS "Target roi_detect_hailo_main: DISABLED (missing dependencies)")

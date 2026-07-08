@@ -15,8 +15,6 @@ enum class CameraFormat {
     YUYV
 };
 
-// V4L2 取流 + MPP 硬件解码（MJPEG 模式）
-// 统一输出：源数据指针、stride、格式，供 RGA 直接导入
 class Camera {
 public:
     Camera();
@@ -47,7 +45,13 @@ private:
 
     MppCtx mpp_ctx_ = nullptr;
     MppApi* mpp_api_ = nullptr;
-    MppFrame mpp_frame_ = nullptr;
+    MppFrame mpp_frame_ = nullptr;   // decoder 返回的 frame 指针（advanced 下等于 out_frame_）
+
+    // MJPEG advanced 解码预分配资源（严格对应 mpi_dec_test 的 dec_advanced）
+    MppFrame out_frame_ = nullptr;   // 预分配的输出 frame
+    MppBuffer frm_buf_ = nullptr;    // 预分配的输出 buffer
+    MppBufferGroup frm_grp_ = nullptr;
+    MppBufferGroup pkt_grp_ = nullptr;
 
     bool init_v4l2(int fps);
     bool init_mpp();

@@ -19,19 +19,10 @@ RgaEngine::Buf RgaEngine::alloc_buf(int w, int h, int fmt, size_t total_size) {
   if (posix_memalign(&b.ptr, 4096, total_size) != 0)
     return {};
   memset(b.ptr, 0, total_size);
-  b.handle = importbuffer_virtualaddr(b.ptr, total_size);
-  if (b.handle <= 0) {
-    free(b.ptr);
-    b.ptr = nullptr;
-    return {};
-  }
-  b.buffer = wrapbuffer_handle(b.handle, w, h, fmt);
   return b;
 }
 
 void RgaEngine::free_buf(Buf &b) {
-  if (b.handle > 0)
-    releasebuffer_handle(b.handle);
   if (b.ptr)
     free(b.ptr);
   b = {};
@@ -58,7 +49,6 @@ bool RgaEngine::init(int num_rois, int roi_w, int roi_h, int gray_w,
   return true;
 }
 
-// 辅助：构造空的 pat 和 prect
 static inline rga_buffer_t empty_rga_buffer() {
   rga_buffer_t buf = {};
   return buf;
@@ -73,18 +63,16 @@ bool RgaEngine::convert_full_bgr(uint8_t *src_ptr, int src_stride, int src_w,
                                  int src_h, int src_fmt) {
   if (!src_ptr)
     return false;
-  rga_buffer_handle_t h =
-      importbuffer_virtualaddr(src_ptr, (size_t)src_stride * src_h * 2);
-  if (h <= 0)
-    return false;
-  rga_buffer_t src = wrapbuffer_handle(h, src_stride, src_h, src_fmt);
+
+  rga_buffer_t src = wrapbuffer_virtualaddr(src_ptr, src_stride, src_h, src_fmt);
+  rga_buffer_t dst = wrapbuffer_virtualaddr(full_bgr_.ptr, full_bgr_.w * 3,
+                                            full_bgr_.h, full_bgr_.fmt);
 
   im_rect src_rect = {0, 0, src_w, src_h};
   im_rect dst_rect = {0, 0, 1920, 1080};
 
-  IM_STATUS ret = improcess(src, full_bgr_.buffer, empty_rga_buffer(), src_rect,
+  IM_STATUS ret = improcess(src, dst, empty_rga_buffer(), src_rect,
                             dst_rect, empty_im_rect(), -1, NULL, NULL, 0);
-  releasebuffer_handle(h);
   if (ret != IM_STATUS_SUCCESS)
     return false;
 
@@ -101,19 +89,17 @@ bool RgaEngine::convert_gray(uint8_t *src_ptr, int src_stride, int src_w,
                              int src_h, int src_fmt) {
   if (!src_ptr)
     return false;
-  rga_buffer_handle_t h =
-      importbuffer_virtualaddr(src_ptr, (size_t)src_stride * src_h * 2);
-  if (h <= 0)
-    return false;
-  rga_buffer_t src = wrapbuffer_handle(h, src_stride, src_h, src_fmt);
+
+  rga_buffer_t src = wrapbuffer_virtualaddr(src_ptr, src_stride, src_h, src_fmt);
+  rga_buffer_t dst = wrapbuffer_virtualaddr(gray_nv12_.ptr, gray_nv12_.w,
+                                            gray_nv12_.h, gray_nv12_.fmt);
 
   im_rect src_rect = {0, 0, src_w, src_h};
   im_rect dst_rect = {0, 0, gray_nv12_.w, gray_nv12_.h};
 
   IM_STATUS ret =
-      improcess(src, gray_nv12_.buffer, empty_rga_buffer(), src_rect, dst_rect,
+      improcess(src, dst, empty_rga_buffer(), src_rect, dst_rect,
                 empty_im_rect(), -1, NULL, NULL, 0);
-  releasebuffer_handle(h);
   if (ret != IM_STATUS_SUCCESS)
     return false;
 
@@ -131,19 +117,18 @@ bool RgaEngine::crop_roi(uint8_t *src_ptr, int src_stride, int src_w, int src_h,
                          int src_fmt, int x, int y, int idx) {
   if (!src_ptr || idx >= (int)roi_bufs_.size())
     return false;
-  rga_buffer_handle_t h =
-      importbuffer_virtualaddr(src_ptr, (size_t)src_stride * src_h * 2);
-  if (h <= 0)
-    return false;
-  rga_buffer_t src = wrapbuffer_handle(h, src_stride, src_h, src_fmt);
+
+  rga_buffer_t src = wrapbuffer_virtualaddr(src_ptr, src_stride, src_h, src_fmt);
+  rga_buffer_t dst = wrapbuffer_virtualaddr(roi_bufs_[idx].ptr,
+                                            roi_bufs_[idx].w * 3,
+                                            roi_bufs_[idx].h, roi_bufs_[idx].fmt);
 
   im_rect src_rect = {x, y, roi_bufs_[idx].w, roi_bufs_[idx].h};
   im_rect dst_rect = {0, 0, roi_bufs_[idx].w, roi_bufs_[idx].h};
 
   IM_STATUS ret =
-      improcess(src, roi_bufs_[idx].buffer, empty_rga_buffer(), src_rect,
+      improcess(src, dst, empty_rga_buffer(), src_rect,
                 dst_rect, empty_im_rect(), -1, NULL, NULL, 0);
-  releasebuffer_handle(h);
   if (ret != IM_STATUS_SUCCESS)
     return false;
 
@@ -166,28 +151,15 @@ bool RgaEngine::crop_to_ptr(uint8_t *src_ptr, int src_stride, int src_w,
   if (!src_ptr || !dst_ptr)
     return false;
 
-  rga_buffer_handle_t src_handle =
-      importbuffer_virtualaddr(src_ptr, (size_t)src_stride * src_h * 2);
-  if (src_handle <= 0)
-    return false;
-  rga_buffer_t src = wrapbuffer_handle(src_handle, src_stride, src_h, src_fmt);
-
-  rga_buffer_handle_t dst_handle =
-      importbuffer_virtualaddr(dst_ptr, (size_t)dst_w * dst_h * 3);
-  if (dst_handle <= 0) {
-    releasebuffer_handle(src_handle);
-    return false;
-  }
-  rga_buffer_t dst =
-      wrapbuffer_handle(dst_handle, dst_w, dst_h, RK_FORMAT_BGR_888);
+  rga_buffer_t src = wrapbuffer_virtualaddr(src_ptr, src_stride, src_h, src_fmt);
+  rga_buffer_t dst = wrapbuffer_virtualaddr(dst_ptr, dst_w * 3, dst_h,
+                                            RK_FORMAT_BGR_888);
 
   im_rect src_rect = {x, y, dst_w, dst_h};
   im_rect dst_rect = {0, 0, dst_w, dst_h};
 
   IM_STATUS ret = improcess(src, dst, empty_rga_buffer(), src_rect, dst_rect,
                             empty_im_rect(), -1, NULL, NULL, 0);
-  releasebuffer_handle(src_handle);
-  releasebuffer_handle(dst_handle);
 
   if (ret != IM_STATUS_SUCCESS) {
     std::cerr << "[RGA] crop_to_ptr failed\n";
