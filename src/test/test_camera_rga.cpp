@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
 
     // 5. 裁剪 7 个 ROI（零拷贝）
     TIMER_STEP_START(cam_rga_test, crop);
-    for (int z = 0; z < 7; ++z) {
+    for (int z = 0; z < 3; ++z) {
       const auto &zone = ZONES[z];
       if (!rga.crop_roi(src, src_stride, src_w, src_h, src_fmt, zone.x, zone.y,
                         z)) {
