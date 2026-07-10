@@ -1,8 +1,8 @@
 #ifndef RGA_ENGINE_H
 #define RGA_ENGINE_H
 
-#include <cstddef> // 修复 im2d.hpp NULL 问题
-#include <cstdlib>
+#include <stddef.h> // 修复 im2d.hpp NULL 问题
+#include <stdlib.h>
 #include <vector>
 
 #include <im2d.hpp>
