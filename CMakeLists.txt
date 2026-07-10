@@ -262,6 +262,10 @@ if(HAILO_RT_FOUND
 
     add_executable(test_camera_rga ./src/test/test_camera_rga.cpp)
     target_link_libraries(test_camera_rga ${PROJECT_NAME})
+
+    add_executable(test_yolo_detector ./src/test/test_yolo_detector.cpp)
+    target_link_libraries(test_yolo_detector ${PROJECT_NAME})
+
 else()
     message(
     STATUS "Target roi_detect_hailo_main: DISABLED (missing dependencies)")
