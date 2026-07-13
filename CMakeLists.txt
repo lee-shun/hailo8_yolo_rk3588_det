@@ -265,6 +265,9 @@ if(HAILO_RT_FOUND
 
     add_executable(test_yolo_detector ./src/test/test_yolo_detector.cpp)
     target_link_libraries(test_yolo_detector ${PROJECT_NAME})
+    
+    add_executable(small_big_benchmark ./src/test/small_big_benchmark.cpp)
+    target_link_libraries(small_big_benchmark ${PROJECT_NAME})
 
 else()
     message(

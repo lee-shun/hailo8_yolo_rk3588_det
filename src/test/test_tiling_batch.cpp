@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
 
   // 设置 batch_size = 4
   infer_model->set_batch_size(4);
-  // 可选: infer_model->set_power_mode(HAILO_POWER_MODE_ULTRA_PERFORMANCE);
+  infer_model->set_power_mode(HAILO_POWER_MODE_ULTRA_PERFORMANCE);
 
   auto configured_infer_model =
       infer_model->configure().expect("Failed to configure");
