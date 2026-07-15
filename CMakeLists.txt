@@ -229,7 +229,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # ============================================================
 # 1. 源文件
 # ============================================================
-set(SOURCES src/camera.cpp src/rga_engine.cpp src/yolo_detector.cpp
+set(SOURCES src/camera.cpp src/cam_dma_mmap.cpp src/rga_engine.cpp src/yolo_detector.cpp
             src/rga_visualizer.cpp src/display_thread.cpp)
 
 # ============================================================
@@ -265,9 +265,12 @@ if(HAILO_RT_FOUND
 
     add_executable(test_yolo_detector ./src/test/test_yolo_detector.cpp)
     target_link_libraries(test_yolo_detector ${PROJECT_NAME})
-    
+
     add_executable(small_big_benchmark ./src/test/small_big_benchmark.cpp)
     target_link_libraries(small_big_benchmark ${PROJECT_NAME})
+
+    add_executable(test_cam_dma_mmap ./src/test/test_cam_dma_mmap.cpp)
+    target_link_libraries(test_cam_dma_mmap ${PROJECT_NAME})
 
 else()
     message(
