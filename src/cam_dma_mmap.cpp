@@ -19,9 +19,6 @@
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #endif
 
-// ---------------------------------------------------------------------------
-// 分级日志宏：自动带上 [DMA/MMAP][MJPEG/YUYV] 前缀
-// ---------------------------------------------------------------------------
 #define CAM_LOG(msg) \
     std::cout << "[CamDmaMmap][" \
               << (mode_ == Mode::DMA ? "DMA" : "MMAP") \
@@ -42,9 +39,6 @@
                   << "] DEBUG: " << msg << "\n"; \
     } while (0)
 
-// ---------------------------------------------------------------------------
-// 构造 / 析构
-// ---------------------------------------------------------------------------
 CamDmaMmap::CamDmaMmap(Mode mode)
     : mode_(mode)
     , stats_start_(std::chrono::steady_clock::now())
@@ -52,9 +46,6 @@ CamDmaMmap::CamDmaMmap(Mode mode)
 
 CamDmaMmap::~CamDmaMmap() { stop(); }
 
-// ---------------------------------------------------------------------------
-// 初始化总入口
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::init(const std::string& dev, int width, int height, int fps, Format fmt)
 {
     width_  = width;
@@ -85,9 +76,6 @@ bool CamDmaMmap::init(const std::string& dev, int width, int height, int fps, Fo
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// V4L2 初始化
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::init_v4l2(int fps)
 {
     struct v4l2_format fmt{};
@@ -137,9 +125,6 @@ bool CamDmaMmap::init_v4l2(int fps)
         return init_v4l2_mmap();
 }
 
-// ---------------------------------------------------------------------------
-// V4L2 MMAP 模式初始化
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::init_v4l2_mmap()
 {
     for (size_t i = 0; i < v4l2_bufs_.size(); ++i) {
@@ -171,9 +156,6 @@ bool CamDmaMmap::init_v4l2_mmap()
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// V4L2 DMA 模式初始化：预先分配 dma-buf，通过 DMABUF 交给 V4L2
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::init_v4l2_dma()
 {
     struct v4l2_format gfmt{};
@@ -186,7 +168,7 @@ bool CamDmaMmap::init_v4l2_dma()
     size_t buf_size = gfmt.fmt.pix.sizeimage;
     if (buf_size == 0) {
         buf_size = (fmt_ == Format::MJPEG) ? (width_ * height_ * 2)
-                                           : (width_ * height_ * 2); // YUYV
+                                           : (width_ * height_ * 2);
     }
     CAM_LOG("V4L2 DMA buffer size=" << buf_size);
 
@@ -243,7 +225,7 @@ bool CamDmaMmap::init_v4l2_dma()
 }
 
 // ---------------------------------------------------------------------------
-// MPP 解码器初始化（仅 MJPEG）
+// 修改 1：无论 DMA/MMAP，都创建 pkt_grp_（DMA 模式下需要 memcpy 路径）
 // ---------------------------------------------------------------------------
 bool CamDmaMmap::init_mpp()
 {
@@ -274,7 +256,6 @@ bool CamDmaMmap::init_mpp()
         mpp_frame_set_ver_stride(out_frame_, ver_stride_);
         mpp_frame_set_fmt(out_frame_, MPP_FMT_YUV420SP);
 
-        // 统一尝试 ION → DMA_HEAP → DRM，不再区分 MMAP/DMA
         if (mpp_buffer_group_get(&frm_grp_, frm_type, MPP_BUFFER_INTERNAL,
                                  "cam_frm", __FUNCTION__) != MPP_OK) {
             CAM_ERR("ION group failed, try DMA_HEAP...");
@@ -336,15 +317,25 @@ bool CamDmaMmap::init_mpp()
             break;
         }
 
-        // MMAP 模式需要 packet buffer 做 memcpy（V4L2 MMAP 数据拷贝到 MPP）
-        // DMA 模式直接 import V4L2 dma-buf，无需 pkt_grp_
-        if (mode_ == Mode::MMAP) {
-            if (mpp_buffer_group_get(&pkt_grp_, MPP_BUFFER_TYPE_ION, MPP_BUFFER_INTERNAL,
+        // 修改：无论 DMA/MMAP，统一创建 packet buffer group
+        // DMA 模式下需要 memcpy V4L2 ION buffer 到内部 ION packet buffer
+        MppBufferType pkt_type = MPP_BUFFER_TYPE_ION;
+        if (mpp_buffer_group_get(&pkt_grp_, pkt_type, MPP_BUFFER_INTERNAL,
+                                 "cam_pkt", __FUNCTION__) != MPP_OK) {
+            CAM_ERR("ION pkt group failed, try DMA_HEAP...");
+            pkt_type = MPP_BUFFER_TYPE_DMA_HEAP;
+            if (mpp_buffer_group_get(&pkt_grp_, pkt_type, MPP_BUFFER_INTERNAL,
                                      "cam_pkt", __FUNCTION__) != MPP_OK) {
-                CAM_ERR("mpp_buffer_group_get(pkt) failed");
-                break;
+                CAM_ERR("DMA_HEAP pkt group failed, try DRM...");
+                pkt_type = MPP_BUFFER_TYPE_DRM;
+                if (mpp_buffer_group_get(&pkt_grp_, pkt_type, MPP_BUFFER_INTERNAL,
+                                         "cam_pkt", __FUNCTION__) != MPP_OK) {
+                    CAM_ERR("DRM pkt group failed, packet allocator exhausted");
+                    break;
+                }
             }
         }
+        CAM_LOG("Packet buffer group type=" << pkt_type);
 
         ok = true;
     } while (0);
@@ -362,9 +353,7 @@ bool CamDmaMmap::init_mpp()
     CAM_LOG("MPP init OK");
     return true;
 }
-// ---------------------------------------------------------------------------
-// 开始 / 停止 视频流
-// ---------------------------------------------------------------------------
+
 bool CamDmaMmap::start()
 {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -416,9 +405,6 @@ void CamDmaMmap::stop()
     }
 }
 
-// ---------------------------------------------------------------------------
-// 取图主逻辑
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::grab()
 {
     release();
@@ -475,9 +461,6 @@ bool CamDmaMmap::grab()
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// MJPEG 处理分发
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::process_mjpeg(const struct v4l2_buffer& buf)
 {
     if (mode_ == Mode::DMA)
@@ -487,32 +470,39 @@ bool CamDmaMmap::process_mjpeg(const struct v4l2_buffer& buf)
 }
 
 // ---------------------------------------------------------------------------
-// MJPEG + DMA：零拷贝路径。直接 import V4L2 的 dma-buf fd 给 MPP
+// 修改 2：DMA 模式不再使用 EXT_DMA import，改为 mmap + memcpy 到内部 ION packet
+// MPP 不支持 EXT_DMA 作为 packet buffer，会导致硬件解码器读取错误数据
 // ---------------------------------------------------------------------------
 bool CamDmaMmap::process_mjpeg_dma(const struct v4l2_buffer& buf)
 {
-    // import V4L2 dma-buf 到 MPP（零拷贝）
-    MppBufferInfo info{};
-    info.type = MPP_BUFFER_TYPE_EXT_DMA;
-    info.fd   = v4l2_bufs_[buf.index].fd;
-    info.size = buf.bytesused;
-    info.ptr  = nullptr;
-    info.hnd  = nullptr;
+    // 1. mmap V4L2 ION buffer 到 CPU 空间（临时读取）
+    uint8_t* v4l2_ptr = (uint8_t*)mmap(nullptr, buf.bytesused, PROT_READ, MAP_SHARED,
+                                        v4l2_bufs_[buf.index].fd, 0);
+    if (v4l2_ptr == MAP_FAILED) {
+        CAM_ERR("mmap V4L2 DMA buffer failed: " << strerror(errno));
+        return false;
+    }
 
+    // 2. 验证 JPEG header
+    if (!check_jpeg_header(v4l2_ptr, buf.bytesused)) {
+        munmap(v4l2_ptr, buf.bytesused);
+        return false;
+    }
+
+    // 3. 分配内部 ION packet buffer
     MppBuffer pkt_buf = nullptr;
-    MPP_RET ret = mpp_buffer_import(&pkt_buf, &info);
+    MPP_RET ret = mpp_buffer_get(pkt_grp_, &pkt_buf, buf.bytesused);
     if (ret != MPP_OK) {
-        CAM_ERR("mpp_buffer_import failed, ret=" << ret);
+        CAM_ERR("mpp_buffer_get(pkt_buf) failed, ret=" << ret);
+        munmap(v4l2_ptr, buf.bytesused);
         return false;
     }
 
-    // 调试：检查 JPEG 头（dma-buf 通常支持 CPU 读）
-    uint8_t* ptr = (uint8_t*)mpp_buffer_get_ptr(pkt_buf);
-    if (ptr && !check_jpeg_header(ptr, buf.bytesused)) {
-        mpp_buffer_put(pkt_buf);
-        return false;
-    }
+    // 4. 拷贝到内部 ION buffer（MPP 硬件解码器只能正确读取内部 buffer）
+    memcpy(mpp_buffer_get_ptr(pkt_buf), v4l2_ptr, buf.bytesused);
+    munmap(v4l2_ptr, buf.bytesused);
 
+    // 5. 后续流程与 MMAP 模式完全一致
     MppPacket packet = nullptr;
     ret = mpp_packet_init_with_buffer(&packet, pkt_buf);
     if (ret != MPP_OK) {
@@ -577,9 +567,6 @@ bool CamDmaMmap::process_mjpeg_dma(const struct v4l2_buffer& buf)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// MJPEG + MMAP：传统路径，需要 memcpy 到 MPP packet buffer
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::process_mjpeg_mmap(const struct v4l2_buffer& buf)
 {
     uint8_t* jpeg_ptr = (uint8_t*)v4l2_bufs_[buf.index].start;
@@ -660,13 +647,10 @@ bool CamDmaMmap::process_mjpeg_mmap(const struct v4l2_buffer& buf)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// YUYV 处理：MMAP 直接返回指针；DMA 直接返回 fd，均零拷贝
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::process_yuyv(const struct v4l2_buffer& buf)
 {
     if (mode_ == Mode::MMAP) {
-        CAM_DBG("YUYV MMAP mode, direct ptr=" << v4l2_bufs_[buf.index].start);
+        CAM_DBG("YUYV MMAP mode, ptr=" << v4l2_bufs_[buf.index].start);
     } else {
         CAM_DBG("YUYV DMA mode, fd=" << v4l2_bufs_[buf.index].fd
                 << " bytesused=" << buf.bytesused);
@@ -674,9 +658,6 @@ bool CamDmaMmap::process_yuyv(const struct v4l2_buffer& buf)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// JPEG 头详细检查
-// ---------------------------------------------------------------------------
 bool CamDmaMmap::check_jpeg_header(const uint8_t* data, size_t len)
 {
     if (len < 2) {
@@ -701,7 +682,6 @@ bool CamDmaMmap::check_jpeg_header(const uint8_t* data, size_t len)
         return false;
     }
 
-    // 扫描 SOF 标记，打印内嵌宽高
     for (size_t i = 2; i + 9 < len; ++i) {
         if (data[i] == 0xFF && (data[i + 1] & 0xF0) == 0xC0 &&
             data[i + 1] != 0xC4 && data[i + 1] != 0xC8 && data[i + 1] != 0xCC)
@@ -716,9 +696,6 @@ bool CamDmaMmap::check_jpeg_header(const uint8_t* data, size_t len)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 释放当前帧：QBUF 回 V4L2，释放 MPP frame
-// ---------------------------------------------------------------------------
 void CamDmaMmap::release()
 {
     if (v4l2_buf_idx_ >= 0) {
@@ -745,9 +722,6 @@ void CamDmaMmap::release()
     mpp_frame_ = nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// 清理 MPP / Buffer 资源
-// ---------------------------------------------------------------------------
 void CamDmaMmap::cleanup()
 {
     if (mpp_ctx_) {
@@ -791,51 +765,49 @@ void CamDmaMmap::cleanup()
     ver_stride_ = 0;
 }
 
-// ---------------------------------------------------------------------------
-// 两套数据访问接口
-// ---------------------------------------------------------------------------
 uint8_t* CamDmaMmap::src_ptr() const
 {
-    if (mode_ != Mode::MMAP) {
-        CAM_ERR("src_ptr() called in DMA mode");
-        return nullptr;
-    }
-    if (v4l2_buf_idx_ < 0) return nullptr;
-
     if (fmt_ == Format::MJPEG) {
         if (!mpp_frame_) return nullptr;
         MppBuffer buffer = mpp_frame_get_buffer(mpp_frame_);
         if (!buffer) return nullptr;
         return (uint8_t*)mpp_buffer_get_ptr(buffer);
     } else {
-        return (uint8_t*)v4l2_bufs_[v4l2_buf_idx_].start;
+        if (mode_ == Mode::MMAP) {
+            if (v4l2_buf_idx_ < 0) return nullptr;
+            return (uint8_t*)v4l2_bufs_[v4l2_buf_idx_].start;
+        } else {
+            return nullptr;
+        }
     }
 }
 
 int CamDmaMmap::src_fd() const
 {
-    if (mode_ != Mode::DMA) return -1;
-    if (v4l2_buf_idx_ < 0) return -1;
-
     if (fmt_ == Format::MJPEG) {
         if (!mpp_frame_) return -1;
         MppBuffer buffer = mpp_frame_get_buffer(mpp_frame_);
         if (!buffer) return -1;
         return mpp_buffer_get_fd(buffer);
     } else {
+        if (v4l2_buf_idx_ < 0) return -1;
         return v4l2_bufs_[v4l2_buf_idx_].fd;
     }
 }
 
 int CamDmaMmap::src_stride() const
 {
-    if (fmt_ == Format::MJPEG) return hor_stride_;
-    return width_ * 2; // YUYV
+    if (fmt_ == Format::MJPEG) {
+        return hor_stride_;
+    }
+    return width_ * 2;
 }
 
 int CamDmaMmap::src_ver_stride() const
 {
-    if (fmt_ == Format::MJPEG) return ver_stride_;
+    if (fmt_ == Format::MJPEG) {
+        return ver_stride_;
+    }
     return height_;
 }
 
@@ -850,9 +822,6 @@ int CamDmaMmap::src_fmt() const
         return RK_FORMAT_YUYV_422;
 }
 
-// ---------------------------------------------------------------------------
-// 运行期统计
-// ---------------------------------------------------------------------------
 void CamDmaMmap::log_stats()
 {
     auto now = std::chrono::steady_clock::now();

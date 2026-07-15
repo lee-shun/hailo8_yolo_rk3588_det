@@ -9,10 +9,10 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-// ---------------------------------------------------------------------------
-// 全局运行标志，用于 Ctrl+C 优雅退出
-// ---------------------------------------------------------------------------
 static volatile bool g_running = true;
 
 static void signal_handler(int sig)
@@ -21,9 +21,6 @@ static void signal_handler(int sig)
     g_running = false;
 }
 
-// ---------------------------------------------------------------------------
-// 命令行帮助
-// ---------------------------------------------------------------------------
 static void print_usage(const char* prog)
 {
     std::cout << "Usage: " << prog << " [options]\n"
@@ -37,27 +34,24 @@ static void print_usage(const char* prog)
               << "  -n <count>    Number of frames to grab, 0=unlimited (default: 0)\n"
               << "  -h            Show this help\n"
               << "\nExamples:\n"
-              << "  # DMA + MJPEG 1920x1080@60\n"
-              << "  " << prog << "\n"
-              << "  # MMAP + YUYV 1280x720@30, grab 100 frames\n"
+              << "  # DMA + MJPEG 1920x1080@60, save 500th frame as .nv12\n"
+              << "  " << prog << " -n 1000\n"
+              << "  # MMAP + YUYV 1280x720@30, save 50th frame as .yuyv\n"
               << "  " << prog << " -m mmap -f yuyv -W 1280 -H 720 -r 30 -n 100\n"
-              << "  # DMA + YUYV 640x480@60\n"
-              << "  " << prog << " -m dma -f yuyv -W 640 -H 480\n";
+              << "\nView saved frame:\n"
+              << "  ffplay -f rawvideo -pixel_format nv12    -video_size 1920x1080 dma_jpeg_500_1000_frame.nv12\n"
+              << "  ffplay -f rawvideo -pixel_format yuyv422 -video_size 1280x720  mmap_yuv_50_100_frame.yuyv\n";
 }
 
-// ---------------------------------------------------------------------------
-// 主函数
-// ---------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
-    // 默认值
     std::string dev_path = "/dev/video0";
     std::string mode_str = "dma";
     std::string fmt_str  = "mjpeg";
     int width  = 1920;
     int height = 1080;
     int fps    = 60;
-    int max_frames = 0;  // 0 = 无限
+    int max_frames = 0;
 
     int opt;
     while ((opt = getopt(argc, argv, "d:m:f:W:H:r:n:h")) != -1) {
@@ -76,25 +70,22 @@ int main(int argc, char** argv)
         }
     }
 
-    // 解析模式
     CamDmaMmap::Mode mode = CamDmaMmap::Mode::DMA;
     if (mode_str == "mmap" || mode_str == "MMAP") {
         mode = CamDmaMmap::Mode::MMAP;
     } else if (mode_str != "dma" && mode_str != "DMA") {
-        std::cerr << "ERROR: Unknown mode '" << mode_str << "', use 'dma' or 'mmap'\n";
+        std::cerr << "ERROR: Unknown mode '" << mode_str << "'\n";
         return 1;
     }
 
-    // 解析格式
     CamDmaMmap::Format fmt = CamDmaMmap::Format::MJPEG;
     if (fmt_str == "yuyv" || fmt_str == "YUYV") {
         fmt = CamDmaMmap::Format::YUYV;
     } else if (fmt_str != "mjpeg" && fmt_str != "MJPEG") {
-        std::cerr << "ERROR: Unknown format '" << fmt_str << "', use 'mjpeg' or 'yuyv'\n";
+        std::cerr << "ERROR: Unknown format '" << fmt_str << "'\n";
         return 1;
     }
 
-    // 注册信号
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
@@ -106,10 +97,13 @@ int main(int argc, char** argv)
               << "  Format : " << (fmt == CamDmaMmap::Format::MJPEG ? "MJPEG" : "YUYV") << "\n"
               << "  Size   : " << width << "x" << height << "\n"
               << "  FPS    : " << fps << "\n"
-              << "  Frames : " << (max_frames > 0 ? std::to_string(max_frames) : "unlimited") << "\n"
-              << "========================================\n";
+              << "  Frames : " << (max_frames > 0 ? std::to_string(max_frames) : "unlimited") << "\n";
+    if (max_frames > 0) {
+        std::cout << "  Save   : Will save frame #" << (max_frames / 2)
+                  << " (n/2 of " << max_frames << ")\n";
+    }
+    std::cout << "========================================\n";
 
-    // 创建相机对象
     CamDmaMmap cam(mode);
     if (!cam.init(dev_path, width, height, fps, fmt)) {
         std::cerr << "ERROR: Camera init failed\n";
@@ -121,12 +115,114 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 统计变量
     int frame_count = 0;
     int ok_count = 0;
     int err_count = 0;
+    bool saved_frame = false;
     auto t_start = std::chrono::steady_clock::now();
     auto t_last  = t_start;
+
+    auto do_save_frame = [&](int frame_num) {
+        std::string mode_name = (mode == CamDmaMmap::Mode::DMA) ? "dma" : "mmap";
+        std::string fmt_name  = (fmt == CamDmaMmap::Format::MJPEG) ? "jpeg" : "yuv";
+        std::string ext       = (fmt == CamDmaMmap::Format::MJPEG) ? "nv12" : "yuyv";
+        std::string filename = mode_name + "_" + fmt_name + "_" 
+                             + std::to_string(frame_num) + "_" 
+                             + std::to_string(max_frames) + "_frame." + ext;
+
+        int w = cam.src_w();
+        int h = cam.src_h();
+        int stride = cam.src_stride();
+        int ver_stride = cam.src_ver_stride();
+
+        uint8_t* ptr = nullptr;
+        bool need_munmap = false;
+        size_t mmap_size = 0;
+
+        // -----------------------------------------------------------------
+        // 核心修复：MJPEG 统一使用 src_ptr()，不再重新 mmap fd
+        // MPP 的 ION buffer 在 mpp_buffer_get() 时已 mmap，且 MPP 内部已处理 cache sync
+        // 重新 mmap 同一个 fd 会导致二次映射 cache 不一致，出现花屏/错位
+        // -----------------------------------------------------------------
+        if (fmt == CamDmaMmap::Format::MJPEG) {
+            ptr = cam.src_ptr();
+            if (!ptr) {
+                std::cerr << "\n[Save] ERROR: src_ptr() returned null for MJPEG\n";
+                return;
+            }
+            // DMA/MMAP 模式下，src_ptr() 均返回 MPP 内部管理的 CPU 映射地址
+            std::cout << "MJPEG save using src_ptr=" << static_cast<void*>(ptr)
+                    << " stride=" << stride << " ver_stride=" << ver_stride<<std::endl;
+        } else {
+            // YUYV: MMAP 直接取 ptr，DMA 需要 mmap fd
+            if (mode == CamDmaMmap::Mode::MMAP) {
+                ptr = cam.src_ptr();
+                if (!ptr) {
+                    std::cerr << "\n[Save] ERROR: src_ptr() returned null for YUYV MMAP\n";
+                    return;
+                }
+            } else {
+                // YUYV + DMA: V4L2 dma-buf 没有 CPU 映射，必须 mmap
+                int fd = cam.src_fd();
+                if (fd < 0) {
+                    std::cerr << "\n[Save] ERROR: src_fd() invalid for YUYV DMA\n";
+                    return;
+                }
+                mmap_size = (size_t)stride * h; // YUYV: stride * height
+                ptr = (uint8_t*)mmap(nullptr, mmap_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (ptr == MAP_FAILED) {
+                    std::cerr << "\n[Save] ERROR: mmap failed: " << strerror(errno) << "\n";
+                    return;
+                }
+                need_munmap = true;
+            }
+        }
+
+        FILE* fp = fopen(filename.c_str(), "wb");
+        if (!fp) {
+            std::cerr << "\n[Save] ERROR: Failed to open " << filename << "\n";
+            if (need_munmap) munmap(ptr, mmap_size);
+            return;
+        }
+
+        if (fmt == CamDmaMmap::Format::MJPEG) {
+            // NV12: 逐行拷贝有效区域，去除 stride padding
+            // Y 平面
+            for (int row = 0; row < h; ++row) {
+                fwrite(ptr + (size_t)row * stride, 1, w, fp);
+            }
+            // UV 平面：从 stride * ver_stride 偏移开始（MPP 物理布局）
+            uint8_t* uv_ptr = ptr + (size_t)stride * ver_stride;
+            for (int row = 0; row < h / 2; ++row) {
+                fwrite(uv_ptr + (size_t)row * stride, 1, w, fp);
+            }
+        } else {
+            // YUYV: h 行，每行 w*2 字节
+            for (int row = 0; row < h; ++row) {
+                fwrite(ptr + (size_t)row * stride, 1, w * 2, fp);
+            }
+        }
+
+        fclose(fp);
+        if (need_munmap) munmap(ptr, mmap_size);
+
+        std::cout << "\n========================================\n"
+                  << "  FRAME SAVED\n"
+                  << "========================================\n"
+                  << "  File:       " << filename << "\n"
+                  << "  Resolution: " << w << "x" << h << "\n"
+                  << "  Stride:     " << stride << "x" << ver_stride << "\n";
+        if (fmt == CamDmaMmap::Format::MJPEG) {
+            std::cout << "  Format:     NV12 (YUV420SP, no padding)\n"
+                      << "  View cmd:   ffplay -f rawvideo -pixel_format nv12 -video_size "
+                      << w << "x" << h << " " << filename << "\n";
+        } else {
+            std::cout << "  Format:     YUYV422 (packed, no padding)\n"
+                      << "  View cmd:   ffplay -f rawvideo -pixel_format yuyv422 -video_size "
+                      << w << "x" << h << " " << filename << "\n";
+        }
+        std::cout << "========================================\n";
+    };
 
     while (g_running) {
         if (max_frames > 0 && frame_count >= max_frames)
@@ -137,39 +233,28 @@ int main(int argc, char** argv)
 
         if (!ok) {
             err_count++;
-            // grab 内部已经做了 release/QBUF，无需额外处理
             continue;
         }
 
         ok_count++;
 
-        // 根据模式读取数据（验证接口可用性）
+        if (max_frames > 0 && !saved_frame && ok_count == max_frames / 2) {
+            do_save_frame(ok_count);
+            saved_frame = true;
+        }
+
+        // 接口验证
         if (mode == CamDmaMmap::Mode::DMA) {
-            int fd = cam.src_fd();
-            if (fd < 0) {
-                std::cerr << "ERROR: src_fd() returned " << fd << "\n";
-            } else {
-                // DMA 模式下 fd 有效，可在此送入 RGA/MPP Encoder
-                (void)fd;  // 避免未使用警告
-            }
+            (void)cam.src_fd();
         } else {
-            uint8_t* ptr = cam.src_ptr();
-            if (!ptr) {
-                std::cerr << "ERROR: src_ptr() returned null\n";
-            } else {
-                // MMAP 模式下 ptr 有效，可在此做 CPU 处理
-                (void)ptr;
-            }
+            (void)cam.src_ptr();
         }
 
         cam.release();
 
-        // 每秒打印一次实时帧率
         auto t_now = std::chrono::steady_clock::now();
         double elapsed_sec = std::chrono::duration<double>(t_now - t_last).count();
         if (elapsed_sec >= 1.0) {
-            double instant_fps = (frame_count - (ok_count + err_count - ok_count)) / elapsed_sec; // 简化
-            // 实际计算：这一秒内成功抓取的帧数
             static int last_ok = 0;
             int delta_ok = ok_count - last_ok;
             last_ok = ok_count;
@@ -184,7 +269,6 @@ int main(int argc, char** argv)
         }
     }
 
-    // 停止并打印最终报告
     cam.stop();
 
     auto t_end = std::chrono::steady_clock::now();
@@ -200,8 +284,13 @@ int main(int argc, char** argv)
               << "  Avg FPS    : " << (total_sec > 0 ? (ok_count / total_sec) : 0.0) << "\n"
               << "  Class stats: total=" << cam.total_frames()
               << " ok=" << cam.ok_frames()
-              << " err=" << cam.err_frames() << "\n"
-              << "========================================\n";
+              << " err=" << cam.err_frames() << "\n";
+    if (max_frames > 0 && !saved_frame) {
+        std::cout << "  Save       : FAILED (not enough OK frames)\n";
+    } else if (saved_frame) {
+        std::cout << "  Save       : OK (frame #" << max_frames / 2 << ")\n";
+    }
+    std::cout << "========================================\n";
 
     return 0;
 }
