@@ -21,7 +21,8 @@ std::shared_ptr<uint8_t> YoloDetector::aligned_alloc(size_t size) {
 }
 
 bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
-                        uint16_t batch_size) {
+                        uint16_t batch_size,
+                        const std::vector<int> &input_fds) {
   conf_thresh_ = conf;
   batch_size_ = batch_size;
 
@@ -44,6 +45,11 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
   }
   infer_model_ = model.release();
   infer_model_->set_batch_size(batch_size_);
+
+  // ===== 性能优化：最高功率模式 + 关闭测量开销 =====
+  infer_model_->set_power_mode(HAILO_POWER_MODE_ULTRA_PERFORMANCE);
+  infer_model_->set_hw_latency_measurement_flags(HAILO_LATENCY_NONE);
+  // ====================================================
 
   try {
     for (const auto &n : infer_model_->get_output_names()) {
@@ -93,13 +99,21 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
   input_name_ = infer_model_->get_input_names()[0];
   std::cout << "[INFO] Input name: " << input_name_ << "\n";
 
-  // 分配连续输入 buffer（所有 batch 帧）
-  input_buf_ = aligned_alloc(single_frame_size_ * batch_size_);
-
   auto out_names = infer_model_->get_output_names();
   std::cout << "[INFO] Outputs: " << out_names.size() << "\n";
 
-  // 创建 batch_size 个 Bindings，每个绑定独立的输入/输出偏移
+  // 判断是否真零拷贝模式
+  bool zero_copy = (!input_fds.empty()) &&
+                   (static_cast<int>(input_fds.size()) == batch_size_);
+  std::cout << "[INFO] YOLO: " << (zero_copy ? "Using Zero Copy!" : "CPU mode")
+            << std::endl;
+
+  if (!zero_copy) {
+    // 传统模式：分配 CPU 输入 buffer
+    input_buf_ = aligned_alloc(single_frame_size_ * batch_size_);
+  }
+
+  // 创建 batch_size 个 Bindings
   for (uint16_t b = 0; b < batch_size_; ++b) {
     auto b_expected = configured_model_->create_bindings();
     if (!b_expected) {
@@ -109,20 +123,40 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
     }
     hailort::ConfiguredInferModel::Bindings binding = b_expected.release();
 
-    // 输入：绑定到大 buffer 的对应偏移（单帧大小）
+    // ---- 输入绑定 ----
     auto bind_in = binding.input(input_name_);
     if (!bind_in) {
       std::cerr << "[ERROR] binding.input() failed\n";
       return false;
     }
-    auto in_st = bind_in->set_buffer(hailort::MemoryView(
-        input_buf_.get() + b * single_frame_size_, single_frame_size_));
-    if (in_st != HAILO_SUCCESS) {
-      std::cerr << "[ERROR] set_buffer(input) failed: " << in_st << "\n";
-      return false;
+
+    if (zero_copy) {
+      // 真零拷贝：直接绑定 dmabuf fd
+      hailo_dma_buffer_t dma_buf{input_fds[b], single_frame_size_};
+      auto in_st = bind_in->set_dma_buffer(dma_buf);
+      if (in_st != HAILO_SUCCESS) {
+        std::cerr << "[ERROR] set_dma_buffer(input, fd=" << input_fds[b]
+                  << ") failed: " << in_st << "\n";
+        return false;
+      }
+      // 提前注册 DMA mapping，避免运行时开销，并提升 async 性能
+      auto map_st = vdevice_->dma_map_dmabuf(input_fds[b], single_frame_size_,
+                                             HAILO_DMA_BUFFER_DIRECTION_H2D);
+      if (map_st != HAILO_SUCCESS) {
+        std::cerr << "[WARN] dma_map_dmabuf(input fd=" << input_fds[b]
+                  << ") failed: " << map_st << "\n";
+      }
+    } else {
+      // 传统模式：绑定 CPU 指针
+      auto in_st = bind_in->set_buffer(hailort::MemoryView(
+          input_buf_.get() + b * single_frame_size_, single_frame_size_));
+      if (in_st != HAILO_SUCCESS) {
+        std::cerr << "[ERROR] set_buffer(input) failed: " << in_st << "\n";
+        return false;
+      }
     }
 
-    // 输出：每个 binding 独立的输出 buffer
+    // ---- 输出绑定（不变，仍用 CPU buffer）----
     for (auto &n : out_names) {
       auto out_info = infer_model_->output(n);
       if (!out_info)
@@ -150,7 +184,8 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
   }
 
   std::cout << "[INFO] Load success, " << bindings_vec_.size()
-            << " bindings created\n";
+            << " bindings created" << (zero_copy ? " (ZERO-COPY mode)" : "")
+            << "\n";
   return true;
 }
 
@@ -166,7 +201,6 @@ uint16_t YoloDetector::batch_size() const { return batch_size_; }
 
 std::vector<Detection> YoloDetector::infer() {
   if (batch_size_ == 1) {
-    // batch=1：同步 run
     auto status = configured_model_->run(bindings_vec_[0],
                                          std::chrono::milliseconds(5000));
     if (status != HAILO_SUCCESS) {
@@ -174,7 +208,6 @@ std::vector<Detection> YoloDetector::infer() {
       throw std::runtime_error("Hailo inference failed");
     }
   } else {
-    // batch>1：通过 run_async(vector<Bindings>) 一次提交所有帧
     auto job_expected = configured_model_->run_async(bindings_vec_);
     if (!job_expected) {
       std::cerr << "[ERROR] run_async failed: " << job_expected.status()
@@ -188,12 +221,10 @@ std::vector<Detection> YoloDetector::infer() {
       throw std::runtime_error("Hailo wait failed");
     }
   }
-  // benchmark 只解析首帧输出，不关心结果正确性
   return parse_output((float *)output_ptrs_[0], nn_w_, nn_h_);
 }
 
 std::vector<std::vector<Detection>> YoloDetector::infer_all() {
-  // ---- 执行推理（与 infer() 的 run 逻辑完全一致）----
   if (batch_size_ == 1) {
     auto status = configured_model_->run(bindings_vec_[0],
                                          std::chrono::milliseconds(5000));
@@ -204,7 +235,8 @@ std::vector<std::vector<Detection>> YoloDetector::infer_all() {
   } else {
     auto job_expected = configured_model_->run_async(bindings_vec_);
     if (!job_expected) {
-      std::cerr << "[ERROR] run_async failed: " << job_expected.status() << "\n";
+      std::cerr << "[ERROR] run_async failed: " << job_expected.status()
+                << "\n";
       throw std::runtime_error("Hailo run_async failed");
     }
     auto job = job_expected.release();
@@ -215,7 +247,6 @@ std::vector<std::vector<Detection>> YoloDetector::infer_all() {
     }
   }
 
-  // ---- 解析每一帧输出（假设单输出节点）----
   std::vector<std::vector<Detection>> all_dets;
   for (uint16_t b = 0; b < batch_size_; ++b) {
     if (b < output_ptrs_.size()) {
@@ -226,7 +257,6 @@ std::vector<std::vector<Detection>> YoloDetector::infer_all() {
   }
   return all_dets;
 }
-
 
 std::vector<Detection> YoloDetector::infer(const uint8_t *bgr_buf) {
   std::memcpy(input_buf_.get(), bgr_buf, single_frame_size_ * batch_size_);

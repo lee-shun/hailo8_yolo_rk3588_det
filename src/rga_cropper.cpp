@@ -1,211 +1,284 @@
 #include "rga_cropper.h"
+#include <cstring>
 #include <fcntl.h>
-#include <unistd.h>
+#include <fstream>
+#include <iostream>
+#include <linux/dma-heap.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <linux/dma-heap.h>
-#include <cstring>
-#include <iostream>
-#include <fstream>
+#include <unistd.h>
 
 #define RGA_LOG(msg) std::cout << "[RgaCropper] " << msg << "\n"
 #define RGA_ERR(msg) std::cerr << "[RgaCropper] ERROR: " << msg << "\n"
 
 RgaCropper::RgaCropper(int src_w, int src_h, int tile_w, int tile_h,
-                       int tile_cols, int tile_rows,
-                       int overlap_w, int overlap_h)
+                       int tile_cols, int tile_rows, int overlap_w,
+                       int overlap_h)
     : src_w_(src_w), src_h_(src_h), tile_w_(tile_w), tile_h_(tile_h),
-      tile_cols_(tile_cols), tile_rows_(tile_rows),
-      overlap_w_(overlap_w), overlap_h_(overlap_h)
-{
-    // 计算分块区域（支持重叠）
-    int step_x = tile_w_ - overlap_w_;
-    int step_y = tile_h_ - overlap_h_;
+      tile_cols_(tile_cols), tile_rows_(tile_rows), overlap_w_(overlap_w),
+      overlap_h_(overlap_h) {
+  int step_x = tile_w_ - overlap_w_;
+  int step_y = tile_h_ - overlap_h_;
 
-    for (int row = 0; row < tile_rows_; ++row) {
-        for (int col = 0; col < tile_cols_; ++col) {
-            im_rect rect;
-            rect.x = col * step_x;
-            rect.y = row * step_y;
-            rect.width  = tile_w_;
-            rect.height = tile_h_;
-            src_rects_.push_back(rect);
-        }
+  for (int row = 0; row < tile_rows_; ++row) {
+    for (int col = 0; col < tile_cols_; ++col) {
+      im_rect rect;
+      rect.x = col * step_x;
+      rect.y = row * step_y;
+      rect.width = tile_w_;
+      rect.height = tile_h_;
+      src_rects_.push_back(rect);
     }
+  }
 
-    // 验证最后一个块不超出源图
-    if (!src_rects_.empty()) {
-        const im_rect& last = src_rects_.back();
-        int max_x = last.x + last.width;
-        int max_y = last.y + last.height;
-        if (max_x > src_w_ || max_y > src_h_) {
-            RGA_ERR("Tile grid exceeds source image! "
-                    << "last_tile=(" << last.x << "," << last.y << ","
-                    << last.width << "," << last.height << ")"
-                    << " src=" << src_w_ << "x" << src_h_);
-        }
+  if (!src_rects_.empty()) {
+    const im_rect &last = src_rects_.back();
+    int max_x = last.x + last.width;
+    int max_y = last.y + last.height;
+    if (max_x > src_w_ || max_y > src_h_) {
+      RGA_ERR("Tile grid exceeds source image! "
+              << "last_tile=(" << last.x << "," << last.y << "," << last.width
+              << "," << last.height << ")"
+              << " src=" << src_w_ << "x" << src_h_);
     }
+  }
 
-    RGA_LOG("Config: src=" << src_w_ << "x" << src_h_
-            << " tile=" << tile_w_ << "x" << tile_h_
-            << " grid=" << tile_cols_ << "x" << tile_rows_
-            << " overlap=" << overlap_w_ << "x" << overlap_h_
-            << " tiles=" << tile_count());
+  tile_size_ = static_cast<size_t>(tile_w_) * tile_h_ * 3;
+
+  RGA_LOG("Config: src=" << src_w_ << "x" << src_h_ << " tile=" << tile_w_
+                         << "x" << tile_h_ << " grid=" << tile_cols_ << "x"
+                         << tile_rows_ << " overlap=" << overlap_w_ << "x"
+                         << overlap_h_ << " tiles=" << tile_count()
+                         << " tile_size=" << tile_size_);
 }
 
 RgaCropper::~RgaCropper() {
-    release_dma_buf();
+  release_tile_dma_bufs();
+  release_dma_buf();
 }
 
 bool RgaCropper::alloc_dma_buf(size_t size) {
-    int heap_fd = open("/dev/dma_heap/system-uncached", O_RDWR | O_CLOEXEC);
-    if (heap_fd < 0) {
-        RGA_ERR("open system-uncached failed: " << strerror(errno) << ", fallback to system");
-        heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
-        if (heap_fd < 0) {
-            RGA_ERR("open system failed: " << strerror(errno));
-            return false;
-        }
-    }
+  // 旧接口兼容：不再主动分配大 buffer，若需要可在此扩展
+  (void)size;
+  return true;
+}
 
+bool RgaCropper::alloc_tile_dma_bufs() {
+  int heap_fd = open("/dev/dma_heap/system-uncached", O_RDWR | O_CLOEXEC);
+  if (heap_fd < 0) {
+    RGA_ERR("open system-uncached failed: " << strerror(errno)
+                                            << ", fallback to system");
+    heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+    if (heap_fd < 0) {
+      RGA_ERR("open system failed: " << strerror(errno));
+      return false;
+    }
+  }
+
+  for (int i = 0; i < tile_count(); ++i) {
     struct dma_heap_allocation_data alloc_data;
     memset(&alloc_data, 0, sizeof(alloc_data));
-    alloc_data.len = size;
+    alloc_data.len = tile_size_;
     alloc_data.fd = 0;
     alloc_data.fd_flags = O_RDWR | O_CLOEXEC;
     alloc_data.heap_flags = 0;
 
     if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) < 0) {
-        RGA_ERR("DMA_HEAP_IOCTL_ALLOC failed: " << strerror(errno));
-        close(heap_fd);
-        return false;
+      RGA_ERR("DMA_HEAP_IOCTL_ALLOC tile " << i
+                                           << " failed: " << strerror(errno));
+      close(heap_fd);
+      release_tile_dma_bufs();
+      return false;
     }
+    tile_fds_.push_back(alloc_data.fd);
+    RGA_LOG("tile dma_buf " << i << " allocated: fd=" << alloc_data.fd
+                            << " size=" << tile_size_);
+  }
 
-    close(heap_fd);
-    dst_fd_ = alloc_data.fd;
-    dst_size_ = size;
-    RGA_LOG("dst dma_buf allocated: fd=" << dst_fd_ << " size=" << size);
-    return true;
+  close(heap_fd);
+  return true;
 }
 
 void RgaCropper::release_dma_buf() {
-    if (dst_fd_ >= 0) {
-        close(dst_fd_);
-        dst_fd_ = -1;
-        dst_size_ = 0;
-    }
+  if (dst_fd_ >= 0) {
+    close(dst_fd_);
+    dst_fd_ = -1;
+    dst_size_ = 0;
+  }
 }
 
-bool RgaCropper::init() {
-    dst_size_ = tile_w_ * tile_h_ * 3 * tile_count();
-    return alloc_dma_buf(dst_size_);
+void RgaCropper::release_tile_dma_bufs() {
+  for (int fd : tile_fds_) {
+    if (fd >= 0)
+      close(fd);
+  }
+  tile_fds_.clear();
 }
+
+bool RgaCropper::init() { return alloc_tile_dma_bufs(); }
 
 bool RgaCropper::process(int src_fd, int src_fmt, int src_w, int src_h) {
-    if (dst_fd_ < 0) {
-        RGA_ERR("dst_fd not ready, call init() first");
-        return false;
-    }
+  if (tile_fds_.size() != static_cast<size_t>(tile_count())) {
+    RGA_ERR("tile_fds not ready, call init() first");
+    return false;
+  }
 
-    rga_buffer_t src = wrapbuffer_fd(src_fd, src_w, src_h, src_fmt, src_w, src_h);
-    src.vir_addr = nullptr;
-    src.phy_addr = nullptr;
+  rga_buffer_t src = wrapbuffer_fd(src_fd, src_w, src_h, src_fmt, src_w, src_h);
+  src.vir_addr = nullptr;
+  src.phy_addr = nullptr;
 
-    int dst_total_h = tile_h_ * tile_count();
-    rga_buffer_t dst = wrapbuffer_fd(dst_fd_, tile_w_, dst_total_h,
-                                      RK_FORMAT_RGB_888, tile_w_, dst_total_h);
+  rga_buffer_t pat = {};
+  memset(&pat, 0, sizeof(pat));
+
+  for (size_t i = 0; i < src_rects_.size(); ++i) {
+    // 每个 tile 写入自己独立的 dmabuf，offset 永远为 0
+    rga_buffer_t dst = wrapbuffer_fd(tile_fds_[i], tile_w_, tile_h_,
+                                     RK_FORMAT_RGB_888, tile_w_, tile_h_);
     dst.vir_addr = nullptr;
     dst.phy_addr = nullptr;
 
-    rga_buffer_t pat = {};
-    memset(&pat, 0, sizeof(pat));
+    im_rect dst_rect = {0, 0, tile_w_, tile_h_};
 
-    for (size_t i = 0; i < src_rects_.size(); ++i) {
-        im_rect dst_rect = {0, (int)(i * tile_h_), tile_w_, tile_h_};
-
-        IM_STATUS ret = ::improcess(src, dst, pat,
-                                    src_rects_[i], dst_rect, {},
-                                    IM_SYNC);
-        if (ret != IM_STATUS_SUCCESS) {
-            RGA_ERR("improcess task " << i << " failed: " << imStrError(ret));
-            return false;
-        }
+    IM_STATUS ret =
+        ::improcess(src, dst, pat, src_rects_[i], dst_rect, {}, IM_SYNC);
+    if (ret != IM_STATUS_SUCCESS) {
+      RGA_ERR("improcess task " << i << " failed: " << imStrError(ret));
+      return false;
     }
+  }
 
-    return true;
+  return true;
 }
 
-bool RgaCropper::save_bmp(const std::string& path, const uint8_t* rgb_data, int w, int h) {
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) {
-        RGA_ERR("Cannot open " << path);
-        return false;
-    }
-
-    int row_stride = w * 3;
-    int padding = (4 - (row_stride % 4)) % 4;
-    int bmp_row_stride = row_stride + padding;
-    int data_size = bmp_row_stride * h;
-    int file_size = 14 + 40 + data_size;
-
-    uint8_t fh[14] = { 'B','M', 0,0,0,0, 0,0,0,0, 54,0,0,0 };
-    fh[2] = file_size & 0xFF;
-    fh[3] = (file_size >> 8) & 0xFF;
-    fh[4] = (file_size >> 16) & 0xFF;
-    fh[5] = (file_size >> 24) & 0xFF;
-
-    uint8_t ih[40] = { 40,0,0,0, 0,0,0,0, 0,0,0,0, 1,0,24,0,
-                       0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-                       0,0,0,0, 0,0,0,0 };
-    ih[4] = w & 0xFF; ih[5] = (w >> 8) & 0xFF; ih[6] = (w >> 16) & 0xFF; ih[7] = (w >> 24) & 0xFF;
-    ih[8] = h & 0xFF; ih[9] = (h >> 8) & 0xFF; ih[10] = (h >> 16) & 0xFF; ih[11] = (h >> 24) & 0xFF;
-
-    ofs.write((char*)fh, 14);
-    ofs.write((char*)ih, 40);
-
-    std::vector<uint8_t> row(bmp_row_stride, 0);
-    for (int y = h - 1; y >= 0; --y) {
-        const uint8_t* src = rgb_data + y * w * 3;
-        for (int x = 0; x < w; ++x) {
-            row[x * 3 + 0] = src[x * 3 + 2];
-            row[x * 3 + 1] = src[x * 3 + 1];
-            row[x * 3 + 2] = src[x * 3 + 0];
-        }
-        if (padding) memset(row.data() + row_stride, 0, padding);
-        ofs.write((char*)row.data(), bmp_row_stride);
-    }
-
-    ofs.close();
-    return true;
+int RgaCropper::dst_fd() const {
+  return dst_fd_; // 保持兼容，返回 -1 表示单一大 buffer 不再使用
 }
 
+size_t RgaCropper::dst_size() const {
+  return dst_size_; // 保持兼容，返回 0
+}
+
+int RgaCropper::tile_count() const { return tile_cols_ * tile_rows_; }
+
+int RgaCropper::tile_fd(int idx) const {
+  if (idx < 0 || idx >= static_cast<int>(tile_fds_.size()))
+    return -1;
+  return tile_fds_[idx];
+}
+
+size_t RgaCropper::tile_size() const { return tile_size_; }
+
+bool RgaCropper::save_bmp(const std::string &path, const uint8_t *rgb_data,
+                          int w, int h) {
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs) {
+    RGA_ERR("Cannot open " << path);
+    return false;
+  }
+
+  int row_stride = w * 3;
+  int padding = (4 - (row_stride % 4)) % 4;
+  int bmp_row_stride = row_stride + padding;
+  int data_size = bmp_row_stride * h;
+  int file_size = 14 + 40 + data_size;
+
+  uint8_t fh[14] = {'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0};
+  fh[2] = file_size & 0xFF;
+  fh[3] = (file_size >> 8) & 0xFF;
+  fh[4] = (file_size >> 16) & 0xFF;
+  fh[5] = (file_size >> 24) & 0xFF;
+
+  uint8_t ih[40] = {40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+                    24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  ih[4] = w & 0xFF;
+  ih[5] = (w >> 8) & 0xFF;
+  ih[6] = (w >> 16) & 0xFF;
+  ih[7] = (w >> 24) & 0xFF;
+  ih[8] = h & 0xFF;
+  ih[9] = (h >> 8) & 0xFF;
+  ih[10] = (h >> 16) & 0xFF;
+  ih[11] = (h >> 24) & 0xFF;
+
+  ofs.write((char *)fh, 14);
+  ofs.write((char *)ih, 40);
+
+  std::vector<uint8_t> row(bmp_row_stride, 0);
+  for (int y = h - 1; y >= 0; --y) {
+    const uint8_t *src = rgb_data + y * w * 3;
+    for (int x = 0; x < w; ++x) {
+      row[x * 3 + 0] = src[x * 3 + 2];
+      row[x * 3 + 1] = src[x * 3 + 1];
+      row[x * 3 + 2] = src[x * 3 + 0];
+    }
+    if (padding)
+      memset(row.data() + row_stride, 0, padding);
+    ofs.write((char *)row.data(), bmp_row_stride);
+  }
+
+  ofs.close();
+  return true;
+}
+
+// 兼容旧接口：要求传入有效 fd，否则失败
 bool RgaCropper::save_tiles(int dst_fd, size_t dst_size, int tile_w, int tile_h,
-                            int tile_count, const std::string& prefix) {
-    if (dst_fd < 0) {
-        RGA_ERR("Invalid dst_fd");
-        return false;
-    }
+                            int tile_count, const std::string &prefix) {
+  if (dst_fd < 0) {
+    RGA_ERR("save_tiles with single fd is deprecated in zero-copy mode, "
+            "use save_tiles(prefix) instead");
+    return false;
+  }
 
-    void* ptr = mmap(nullptr, dst_size, PROT_READ, MAP_SHARED, dst_fd, 0);
+  void *ptr = mmap(nullptr, dst_size, PROT_READ, MAP_SHARED, dst_fd, 0);
+  if (ptr == MAP_FAILED) {
+    RGA_ERR("mmap dst_fd failed: " << strerror(errno));
+    return false;
+  }
+
+  uint8_t *data = (uint8_t *)ptr;
+  size_t single_tile_size = static_cast<size_t>(tile_w) * tile_h * 3;
+  bool ok = true;
+
+  for (int i = 0; i < tile_count; ++i) {
+    std::string path = prefix + "_" + std::to_string(i) + ".bmp";
+    if (!save_bmp(path, data + i * single_tile_size, tile_w, tile_h)) {
+      RGA_ERR("Failed to save " << path);
+      ok = false;
+      break;
+    }
+    RGA_LOG("Saved " << path);
+  }
+
+  munmap(ptr, dst_size);
+  return ok;
+}
+
+// 新增：利用内部独立 tile fds 保存
+bool RgaCropper::save_tiles(const std::string &prefix) const {
+  if (tile_fds_.size() != static_cast<size_t>(tile_count())) {
+    RGA_ERR("tile_fds not ready");
+    return false;
+  }
+
+  bool ok = true;
+  for (int i = 0; i < tile_count(); ++i) {
+    void *ptr =
+        mmap(nullptr, tile_size_, PROT_READ, MAP_SHARED, tile_fds_[i], 0);
     if (ptr == MAP_FAILED) {
-        RGA_ERR("mmap dst_fd failed: " << strerror(errno));
-        return false;
+      RGA_ERR("mmap tile " << i << " failed: " << strerror(errno));
+      ok = false;
+      break;
     }
 
-    uint8_t* data = (uint8_t*)ptr;
-    size_t tile_size = tile_w * tile_h * 3;
-    bool ok = true;
-
-    for (int i = 0; i < tile_count; ++i) {
-        std::string path = prefix + "_" + std::to_string(i) + ".bmp";
-        if (!save_bmp(path, data + i * tile_size, tile_w, tile_h)) {
-            RGA_ERR("Failed to save " << path);
-            ok = false;
-            break;
-        }
-        RGA_LOG("Saved " << path);
+    std::string path = prefix + "_" + std::to_string(i) + ".bmp";
+    if (!save_bmp(path, static_cast<uint8_t *>(ptr), tile_w_, tile_h_)) {
+      RGA_ERR("Failed to save " << path);
+      munmap(ptr, tile_size_);
+      ok = false;
+      break;
     }
-
-    munmap(ptr, dst_size);
-    return ok;
+    RGA_LOG("Saved " << path);
+    munmap(ptr, tile_size_);
+  }
+  return ok;
 }

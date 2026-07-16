@@ -11,39 +11,47 @@
 
 class RgaCropper {
 public:
-  // overlap_w: 水平方向相邻块的重叠像素（默认0）
-  // overlap_h: 垂直方向相邻块的重叠像素（默认0）
-  RgaCropper(int src_w, int src_h, int tile_w, int tile_h, int tile_cols,
-             int tile_rows, int overlap_w = 0, int overlap_h = 0);
-  ~RgaCropper();
+    RgaCropper(int src_w, int src_h, int tile_w, int tile_h,
+               int tile_cols, int tile_rows, int overlap_w, int overlap_h);
+    ~RgaCropper();
 
-  bool init();
-  bool process(int src_fd, int src_fmt, int src_w, int src_h);
+    bool init();
+    bool process(int src_fd, int src_fmt, int src_w, int src_h);
 
-  int dst_fd() const { return dst_fd_; }
-  size_t dst_size() const { return dst_size_; }
-  int tile_w() const { return tile_w_; }
-  int tile_h() const { return tile_h_; }
-  int tile_count() const { return tile_cols_ * tile_rows_; }
-  int overlap_w() const { return overlap_w_; }
-  int overlap_h() const { return overlap_h_; }
+    // 保持兼容的旧接口（单一大 buffer 模式已废弃，dst_fd() 返回 -1）
+    int dst_fd() const;
+    size_t dst_size() const;
+    int tile_count() const;
 
-  static bool save_tiles(int dst_fd, size_t dst_size, int tile_w, int tile_h,
-                         int tile_count, const std::string &prefix);
+    // 新增：真零拷贝接口
+    int tile_fd(int idx) const;          // 获取第 idx 个 tile 的独立 dmabuf fd
+    size_t tile_size() const;            // 单个 tile 的字节数
+
+    // 保持兼容的 static 版本（仅当传入有效 fd 时可用）
+    static bool save_tiles(int dst_fd, size_t dst_size, int tile_w, int tile_h,
+                           int tile_count, const std::string& prefix);
+    // 新增：使用内部独立 tile fds 保存
+    bool save_tiles(const std::string& prefix) const;
 
 private:
-  int src_w_, src_h_;
-  int tile_w_, tile_h_;
-  int tile_cols_, tile_rows_;
-  int overlap_w_, overlap_h_;
-  int dst_fd_ = -1;
-  size_t dst_size_ = 0;
-  std::vector<im_rect> src_rects_;
+    bool alloc_dma_buf(size_t size);
+    bool alloc_tile_dma_bufs();
+    void release_dma_buf();
+    void release_tile_dma_bufs();
+    static bool save_bmp(const std::string& path, const uint8_t* rgb_data, int w, int h);
 
-  bool alloc_dma_buf(size_t size);
-  void release_dma_buf();
-  static bool save_bmp(const std::string &path, const uint8_t *rgb_data, int w,
-                       int h);
+    int src_w_, src_h_, tile_w_, tile_h_;
+    int tile_cols_, tile_rows_;
+    int overlap_w_, overlap_h_;
+    std::vector<im_rect> src_rects_;
+
+    // 兼容旧接口的占位（不再分配）
+    int dst_fd_ = -1;
+    size_t dst_size_ = 0;
+
+    // 真零拷贝：每个 tile 独立的 dmabuf fd
+    std::vector<int> tile_fds_;
+    size_t tile_size_ = 0;
 };
 
 #endif
