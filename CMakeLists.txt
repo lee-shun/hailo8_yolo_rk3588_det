@@ -275,6 +275,9 @@ if(HAILO_RT_FOUND
     add_executable(test_cam_crop ./src/test/test_cam_crop.cpp)
     target_link_libraries(test_cam_crop ${PROJECT_NAME})
 
+    add_executable(test_cam_crop_yolo ./src/test/test_cam_crop_yolo.cpp)
+    target_link_libraries(test_cam_crop_yolo ${PROJECT_NAME})
+
 else()
     message(
     STATUS "Target roi_detect_hailo_main: DISABLED (missing dependencies)")

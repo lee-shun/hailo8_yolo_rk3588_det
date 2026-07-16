@@ -27,6 +27,8 @@ static void print_usage(const char* prog) {
               << "  -u, --tile-h <n>      Tile height (default: 540)\n"
               << "  -c, --cols <n>        Horizontal tiles (default: 3)\n"
               << "  -r, --rows <n>        Vertical tiles (default: 2)\n"
+              << "  -x, --overlap-w <n>   Horizontal overlap pixels (default: 0)\n"
+              << "  -y, --overlap-h <n>   Vertical overlap pixels (default: 0)\n"
               << "  -F, --format <fmt>    YUYV or MJPEG (default: YUYV)\n"
               << "  --help                Show this help\n";
 }
@@ -40,6 +42,7 @@ int main(int argc, char** argv) {
     std::string output_dir = "./output";
     int warmup = 10;
     int tile_w = 640, tile_h = 540, tile_cols = 3, tile_rows = 2;
+    int overlap_w = 0, overlap_h = 0;
     std::string fmt_str = "YUYV";
 
     static struct option long_opts[] = {
@@ -53,13 +56,15 @@ int main(int argc, char** argv) {
         {"tile-h", required_argument, 0, 'u'},
         {"cols", required_argument, 0, 'c'},
         {"rows", required_argument, 0, 'r'},
+        {"overlap-w", required_argument, 0, 'x'},
+        {"overlap-h", required_argument, 0, 'y'},
         {"format", required_argument, 0, 'F'},
         {"help", no_argument, 0, 0},
         {0, 0, 0, 0}
     };
 
     int c, opt_idx = 0;
-    while ((c = getopt_long(argc, argv, "d:W:H:f:o:n:t:u:c:r:F:", long_opts, &opt_idx)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:W:H:f:o:n:t:u:c:r:x:y:F:", long_opts, &opt_idx)) != -1) {
         switch (c) {
             case 'd': dev = optarg; break;
             case 'W': width = atoi(optarg); break;
@@ -71,20 +76,30 @@ int main(int argc, char** argv) {
             case 'u': tile_h = atoi(optarg); break;
             case 'c': tile_cols = atoi(optarg); break;
             case 'r': tile_rows = atoi(optarg); break;
+            case 'x': overlap_w = atoi(optarg); break;
+            case 'y': overlap_h = atoi(optarg); break;
             case 'F': fmt_str = optarg; break;
             case 0: print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }
 
-    // 验证 tile 网格
-    if (tile_cols * tile_w != width || tile_rows * tile_h != height) {
-        std::cerr << "[Test] ERROR: Tile grid mismatch: "
-                  << tile_cols << "x" << tile_w << "=" << (tile_cols*tile_w)
-                  << " (expected " << width << "), "
-                  << tile_rows << "x" << tile_h << "=" << (tile_rows*tile_h)
-                  << " (expected " << height << ")\n";
+    // 验证 tile 网格（支持重叠）
+    int required_w = tile_cols * tile_w - (tile_cols - 1) * overlap_w;
+    int required_h = tile_rows * tile_h - (tile_rows - 1) * overlap_h;
+
+    if (required_w > width || required_h > height) {
+        std::cerr << "[Test] ERROR: Tile grid with overlap exceeds source image!\n"
+                  << "[Test]   Required: " << required_w << "x" << required_h << "\n"
+                  << "[Test]   Source:   " << width << "x" << height << "\n";
         return 1;
+    }
+
+    if (required_w < width || required_h < height) {
+        std::cout << "[Test] WARN: Tile grid does not fully cover source image. "
+                  << "Some pixels will not be included in any tile.\n"
+                  << "[Test]   Covered: " << required_w << "x" << required_h
+                  << "  Source: " << width << "x" << height << "\n";
     }
 
     mkdir(output_dir.c_str(), 0755);
@@ -98,11 +113,12 @@ int main(int argc, char** argv) {
               << "[Test] Size   : " << width << "x" << height << "@" << fps << "\n"
               << "[Test] Mode   : DMA + " << (cam_fmt == CamDmaMmap::Format::MJPEG ? "MJPEG" : "YUYV") << "\n"
               << "[Test] Tiles  : " << tile_w << "x" << tile_h
-              << "  grid=" << tile_cols << "x" << tile_rows << "\n"
+              << "  grid=" << tile_cols << "x" << tile_rows
+              << "  overlap=" << overlap_w << "x" << overlap_h << "\n"
               << "[Test] Output : " << output_dir << "\n"
               << "[Test] ==================================================\n";
 
-    // 1. 初始化 Camera（DMA 模式）
+    // 1. 初始化 Camera
     CamDmaMmap cam(CamDmaMmap::Mode::DMA);
     if (!cam.init(dev, width, height, fps, cam_fmt)) {
         std::cerr << "[Test] ERROR: Camera init failed\n";
@@ -113,8 +129,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2. 初始化 RGA Cropper（复用 dst buffer）
-    RgaCropper cropper(width, height, tile_w, tile_h, tile_cols, tile_rows);
+    // 2. 初始化 RGA Cropper（传入重叠参数）
+    RgaCropper cropper(width, height, tile_w, tile_h, tile_cols, tile_rows, overlap_w, overlap_h);
     if (!cropper.init()) {
         std::cerr << "[Test] ERROR: RGA cropper init failed\n";
         return 1;
@@ -143,14 +159,12 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // RGA 硬件处理：色转 + 6 图 crop + 拼接
         bool ok = cropper.process(src_fd, src_fmt, src_w, src_h);
 
         auto t_rga1 = std::chrono::steady_clock::now();
         double rga_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_rga1 - t_rga0).count() / 1000.0;
         total_rga_ms += rga_ms;
 
-        // 释放 V4L2 buffer（RGA 已完成，可以归还）
         cam.release();
 
         if (!ok) {
@@ -160,7 +174,6 @@ int main(int argc, char** argv) {
 
         frame_count++;
 
-        // 计算 FPS
         auto t_now = std::chrono::steady_clock::now();
         double elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_start).count() / 1000.0;
         double fps_actual = (elapsed_s > 0) ? (frame_count / elapsed_s) : 0;
@@ -171,7 +184,6 @@ int main(int argc, char** argv) {
                   << " (avg=" << avg_rga_ms << " ms)"
                   << " | FPS=" << fps_actual << "\n";
 
-        // 达到 warmup 帧后，保存一次 6 张图
         if (frame_count == warmup && !saved) {
             auto t_save0 = std::chrono::steady_clock::now();
             std::string prefix = output_dir + "/tile";
@@ -191,7 +203,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 保存后再跑 30 帧统计稳定 FPS，然后退出
         if (saved && frame_count >= warmup + 30) {
             break;
         }

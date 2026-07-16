@@ -1,12 +1,12 @@
 #ifndef YOLO_DETECTOR_H
 #define YOLO_DETECTOR_H
 
+#include "fusion_roi_predictor.h"
 #include <cstdint>
 #include <hailo/hailort.hpp>
 #include <memory>
 #include <string>
 #include <vector>
-#include "fusion_roi_predictor.h"
 
 class YoloDetector {
 public:
@@ -23,6 +23,8 @@ public:
 
   std::vector<Detection> infer();
   std::vector<Detection> infer(const uint8_t *bgr_buf);
+  // 新增：执行推理并返回所有 batch 帧的解析结果
+  std::vector<std::vector<Detection>> infer_all();
 
 private:
   std::shared_ptr<uint8_t> aligned_alloc(size_t size);

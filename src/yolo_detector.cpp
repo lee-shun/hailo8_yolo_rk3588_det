@@ -192,6 +192,42 @@ std::vector<Detection> YoloDetector::infer() {
   return parse_output((float *)output_ptrs_[0], nn_w_, nn_h_);
 }
 
+std::vector<std::vector<Detection>> YoloDetector::infer_all() {
+  // ---- 执行推理（与 infer() 的 run 逻辑完全一致）----
+  if (batch_size_ == 1) {
+    auto status = configured_model_->run(bindings_vec_[0],
+                                         std::chrono::milliseconds(5000));
+    if (status != HAILO_SUCCESS) {
+      std::cerr << "[ERROR] run() failed: " << status << "\n";
+      throw std::runtime_error("Hailo inference failed");
+    }
+  } else {
+    auto job_expected = configured_model_->run_async(bindings_vec_);
+    if (!job_expected) {
+      std::cerr << "[ERROR] run_async failed: " << job_expected.status() << "\n";
+      throw std::runtime_error("Hailo run_async failed");
+    }
+    auto job = job_expected.release();
+    auto wait_status = job.wait(std::chrono::milliseconds(10000));
+    if (wait_status != HAILO_SUCCESS) {
+      std::cerr << "[ERROR] wait failed: " << wait_status << "\n";
+      throw std::runtime_error("Hailo wait failed");
+    }
+  }
+
+  // ---- 解析每一帧输出（假设单输出节点）----
+  std::vector<std::vector<Detection>> all_dets;
+  for (uint16_t b = 0; b < batch_size_; ++b) {
+    if (b < output_ptrs_.size()) {
+      all_dets.push_back(parse_output((float *)output_ptrs_[b], nn_w_, nn_h_));
+    } else {
+      all_dets.push_back({});
+    }
+  }
+  return all_dets;
+}
+
+
 std::vector<Detection> YoloDetector::infer(const uint8_t *bgr_buf) {
   std::memcpy(input_buf_.get(), bgr_buf, single_frame_size_ * batch_size_);
   return infer();

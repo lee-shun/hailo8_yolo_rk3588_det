@@ -11,23 +11,46 @@
 #define RGA_LOG(msg) std::cout << "[RgaCropper] " << msg << "\n"
 #define RGA_ERR(msg) std::cerr << "[RgaCropper] ERROR: " << msg << "\n"
 
-RgaCropper::RgaCropper(int src_w, int src_h, int tile_w, int tile_h, int tile_cols, int tile_rows)
+RgaCropper::RgaCropper(int src_w, int src_h, int tile_w, int tile_h,
+                       int tile_cols, int tile_rows,
+                       int overlap_w, int overlap_h)
     : src_w_(src_w), src_h_(src_h), tile_w_(tile_w), tile_h_(tile_h),
-      tile_cols_(tile_cols), tile_rows_(tile_rows)
+      tile_cols_(tile_cols), tile_rows_(tile_rows),
+      overlap_w_(overlap_w), overlap_h_(overlap_h)
 {
+    // 计算分块区域（支持重叠）
+    int step_x = tile_w_ - overlap_w_;
+    int step_y = tile_h_ - overlap_h_;
+
     for (int row = 0; row < tile_rows_; ++row) {
         for (int col = 0; col < tile_cols_; ++col) {
             im_rect rect;
-            rect.x = col * tile_w_;
-            rect.y = row * tile_h_;
+            rect.x = col * step_x;
+            rect.y = row * step_y;
             rect.width  = tile_w_;
             rect.height = tile_h_;
             src_rects_.push_back(rect);
         }
     }
+
+    // 验证最后一个块不超出源图
+    if (!src_rects_.empty()) {
+        const im_rect& last = src_rects_.back();
+        int max_x = last.x + last.width;
+        int max_y = last.y + last.height;
+        if (max_x > src_w_ || max_y > src_h_) {
+            RGA_ERR("Tile grid exceeds source image! "
+                    << "last_tile=(" << last.x << "," << last.y << ","
+                    << last.width << "," << last.height << ")"
+                    << " src=" << src_w_ << "x" << src_h_);
+        }
+    }
+
     RGA_LOG("Config: src=" << src_w_ << "x" << src_h_
             << " tile=" << tile_w_ << "x" << tile_h_
-            << " grid=" << tile_cols_ << "x" << tile_rows_);
+            << " grid=" << tile_cols_ << "x" << tile_rows_
+            << " overlap=" << overlap_w_ << "x" << overlap_h_
+            << " tiles=" << tile_count());
 }
 
 RgaCropper::~RgaCropper() {
@@ -84,29 +107,22 @@ bool RgaCropper::process(int src_fd, int src_fmt, int src_w, int src_h) {
         return false;
     }
 
-    // 封装源 Buffer（wstride/hstride 用像素单位，RGA 内部自动乘 bpp）
     rga_buffer_t src = wrapbuffer_fd(src_fd, src_w, src_h, src_fmt, src_w, src_h);
-    // 显式清零地址字段，避免 RGA 驱动误把残留值当有效指针
     src.vir_addr = nullptr;
     src.phy_addr = nullptr;
 
-    // 目标：虚拟为 tile_w x (tile_h * count) 的单张大图
     int dst_total_h = tile_h_ * tile_count();
     rga_buffer_t dst = wrapbuffer_fd(dst_fd_, tile_w_, dst_total_h,
                                       RK_FORMAT_RGB_888, tile_w_, dst_total_h);
     dst.vir_addr = nullptr;
     dst.phy_addr = nullptr;
 
-    // pat（空 buffer，显式清零）
     rga_buffer_t pat = {};
     memset(&pat, 0, sizeof(pat));
 
-    // 使用 C API 单任务同步模式（7参数签名）
-    // Job API 的 improcessTask + imendJob 在某些版本有 Bad address 问题
     for (size_t i = 0; i < src_rects_.size(); ++i) {
         im_rect dst_rect = {0, (int)(i * tile_h_), tile_w_, tile_h_};
 
-        // ::improcess 调用 C API 版本（7个参数），避免 C++ MPI 版本的 fence 问题
         IM_STATUS ret = ::improcess(src, dst, pat,
                                     src_rects_[i], dst_rect, {},
                                     IM_SYNC);
