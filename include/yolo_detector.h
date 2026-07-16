@@ -48,6 +48,7 @@ private:
   std::shared_ptr<uint8_t> input_buf_; // 零拷贝模式下为 nullptr
   std::vector<std::shared_ptr<uint8_t>> output_bufs_;
   std::vector<uint8_t *> output_ptrs_;
+  std::vector<int> output_fds_;  // 记录 dmabuf fd，析构时 munmap/close
 };
 
 #endif

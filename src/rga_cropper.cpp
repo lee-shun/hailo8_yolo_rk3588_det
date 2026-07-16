@@ -64,41 +64,55 @@ bool RgaCropper::alloc_dma_buf(size_t size) {
 }
 
 bool RgaCropper::alloc_tile_dma_bufs() {
-  int heap_fd = open("/dev/dma_heap/system-uncached", O_RDWR | O_CLOEXEC);
-  if (heap_fd < 0) {
-    RGA_ERR("open system-uncached failed: " << strerror(errno)
-                                            << ", fallback to system");
-    heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
-    if (heap_fd < 0) {
-      RGA_ERR("open system failed: " << strerror(errno));
-      return false;
+  // 优先物理连续，失败则回退到普通页内存（Rockchip 上 system 完全可用）
+  const char *heap_paths[] = {
+      "/dev/dma_heap/linux,cma",       "/dev/dma_heap/cma",
+      "/dev/dma_heap/system-uncached", "/dev/dma_heap/linux,system-uncached",
+      "/dev/dma_heap/system",          nullptr};
+
+  for (int i = 0; heap_paths[i] != nullptr; ++i) {
+    int heap_fd = open(heap_paths[i], O_RDWR | O_CLOEXEC);
+    if (heap_fd < 0)
+      continue;
+
+    std::vector<int> tmp_fds;
+    bool ok = true;
+
+    for (int t = 0; t < tile_count(); ++t) {
+      struct dma_heap_allocation_data alloc_data = {};
+      alloc_data.len = tile_size_;
+      alloc_data.fd_flags = O_RDWR | O_CLOEXEC;
+      alloc_data.heap_flags = 0;
+
+      if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) < 0) {
+        RGA_LOG("heap " << heap_paths[i] << " tile " << t << " alloc failed ("
+                        << strerror(errno) << "), trying next...");
+        ok = false;
+        break;
+      }
+      tmp_fds.push_back(alloc_data.fd);
+    }
+
+    close(heap_fd);
+
+    if (ok) {
+      tile_fds_ = std::move(tmp_fds);
+      RGA_LOG("Using dma-heap: " << heap_paths[i] << ", allocated "
+                                 << tile_count()
+                                 << " tiles, size=" << tile_size_);
+      return true;
+    }
+
+    // 清理本次部分分配的 fd，避免泄漏
+    for (int fd : tmp_fds) {
+      if (fd >= 0)
+        close(fd);
     }
   }
 
-  for (int i = 0; i < tile_count(); ++i) {
-    struct dma_heap_allocation_data alloc_data;
-    memset(&alloc_data, 0, sizeof(alloc_data));
-    alloc_data.len = tile_size_;
-    alloc_data.fd = 0;
-    alloc_data.fd_flags = O_RDWR | O_CLOEXEC;
-    alloc_data.heap_flags = 0;
-
-    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) < 0) {
-      RGA_ERR("DMA_HEAP_IOCTL_ALLOC tile " << i
-                                           << " failed: " << strerror(errno));
-      close(heap_fd);
-      release_tile_dma_bufs();
-      return false;
-    }
-    tile_fds_.push_back(alloc_data.fd);
-    RGA_LOG("tile dma_buf " << i << " allocated: fd=" << alloc_data.fd
-                            << " size=" << tile_size_);
-  }
-
-  close(heap_fd);
-  return true;
+  RGA_ERR("Failed to allocate tile dma-bufs from any heap");
+  return false;
 }
-
 void RgaCropper::release_dma_buf() {
   if (dst_fd_ >= 0) {
     close(dst_fd_);

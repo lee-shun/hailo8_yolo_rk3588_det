@@ -229,8 +229,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # ============================================================
 # 1. 源文件
 # ============================================================
-set(SOURCES src/camera.cpp src/cam_dma_mmap.cpp src/rga_engine.cpp src/rga_cropper.cpp src/yolo_detector.cpp
-            src/rga_visualizer.cpp src/display_thread.cpp)
+set(SOURCES src/cam_dma_mmap.cpp src/rga_cropper.cpp src/yolo_detector.cpp)
 
 # ============================================================
 # 1. 目标：只要库找到就编译，不判断平台
@@ -241,31 +240,7 @@ if(HAILO_RT_FOUND
     add_library(${PROJECT_NAME} ${SOURCES})
     target_link_libraries(${PROJECT_NAME} ${COMMON_LIBS} ${HAILO_RT_LIB}
                         ${MPP_LIBRARY} ${RGA_LIBRARY})
-
-    add_executable(roi_detect_hailo_main src/main.cpp)
-    target_link_libraries(roi_detect_hailo_main ${PROJECT_NAME})
-
-    target_compile_options(roi_detect_hailo_main PRIVATE ${OpenMP_CXX_FLAGS})
-    message(STATUS "Target roi_detect_hailo_main: ENABLED")
-
     # test
-    add_executable(test_full_image ./src/test/test_full_image.cpp)
-    target_link_libraries(test_full_image ${COMMON_LIBS} ${HAILO_RT_LIB}
-                        ${MPP_LIBRARY} ${RGA_LIBRARY})
-
-    add_executable(test_tiling_batch ./src/test/test_tiling_batch.cpp)
-    target_link_libraries(test_tiling_batch ${COMMON_LIBS} ${HAILO_RT_LIB}
-                        ${MPP_LIBRARY} ${RGA_LIBRARY})
-
-    add_executable(test_camera ./src/test/test_camera.cpp)
-    target_link_libraries(test_camera ${PROJECT_NAME})
-
-    add_executable(test_camera_rga ./src/test/test_camera_rga.cpp)
-    target_link_libraries(test_camera_rga ${PROJECT_NAME})
-
-    add_executable(test_yolo_detector ./src/test/test_yolo_detector.cpp)
-    target_link_libraries(test_yolo_detector ${PROJECT_NAME})
-
     add_executable(small_big_benchmark ./src/test/small_big_benchmark.cpp)
     target_link_libraries(small_big_benchmark ${PROJECT_NAME})
 

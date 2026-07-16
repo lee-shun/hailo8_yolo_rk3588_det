@@ -1,6 +1,7 @@
 #include "yolo_detector.h"
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 
@@ -49,6 +50,7 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
   // ===== 性能优化：最高功率模式 + 关闭测量开销 =====
   infer_model_->set_power_mode(HAILO_POWER_MODE_ULTRA_PERFORMANCE);
   infer_model_->set_hw_latency_measurement_flags(HAILO_LATENCY_NONE);
+  // infer_model_->set_hw_latency_measurement_flags(HAILO_LATENCY_MEASURE);
   // ====================================================
 
   try {
@@ -186,6 +188,13 @@ bool YoloDetector::load(const std::string &hef_path, float conf, float iou,
   std::cout << "[INFO] Load success, " << bindings_vec_.size()
             << " bindings created" << (zero_copy ? " (ZERO-COPY mode)" : "")
             << "\n";
+
+  // 在 load() 中打印输出格式
+  for (const auto &n : infer_model_->get_output_names()) {
+    auto out = infer_model_->output(n);
+    std::cout << "Output: " << n << " format_order=" << out->format().order
+              << " is_nms=" << out->is_nms() << "\n";
+  }
   return true;
 }
 
@@ -235,8 +244,7 @@ std::vector<std::vector<Detection>> YoloDetector::infer_all() {
   } else {
     auto job_expected = configured_model_->run_async(bindings_vec_);
     if (!job_expected) {
-      std::cerr << "[ERROR] run_async failed: " << job_expected.status()
-                << "\n";
+      std::cerr << "[ERROR] run_async failed: " << job_expected.status() << "\n";
       throw std::runtime_error("Hailo run_async failed");
     }
     auto job = job_expected.release();
@@ -247,6 +255,14 @@ std::vector<std::vector<Detection>> YoloDetector::infer_all() {
     }
   }
 
+  // // 读取硬件延迟（与 hailortcli 的 HW Latency 同口径）
+  // auto hw_lat = configured_model_->get_hw_latency_measurement();
+  // if (hw_lat) {
+  //     double ms = std::chrono::duration<double, std::milli>(hw_lat->avg_hw_latency).count();
+  //     std::cout << "[INFO] HW Latency: " << std::fixed << std::setprecision(6) << ms << " ms\n";
+  // }
+
+  // 解析每一帧输出
   std::vector<std::vector<Detection>> all_dets;
   for (uint16_t b = 0; b < batch_size_; ++b) {
     if (b < output_ptrs_.size()) {
