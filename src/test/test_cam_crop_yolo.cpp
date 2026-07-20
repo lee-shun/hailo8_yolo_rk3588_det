@@ -262,16 +262,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // 验证 RGA 输出总大小与 Hailo 输入总大小一致
-  size_t hailo_input_total = det.input_bytes();
-  if (cropper.dst_size() != hailo_input_total) {
+  det.set_input_buffer((uint8_t *)dst_ptr);
+
+  if (cropper.dst_size() != det.input_bytes()) {
     std::cerr << "[Test] ERROR: RGA dst_size (" << cropper.dst_size()
-              << ") != Hailo input_bytes (" << hailo_input_total << ")\n";
+              << ") != Hailo input_bytes (" << det.input_bytes() << ")\n";
     return 1;
   }
 
   // ============================================================
-  // 4) 主循环：抓图 -> RGA -> memcpy -> Hailo -> 解析
+  // 4) 主循环：抓图 -> RGA -> Hailo -> 解析（zero-copy）
   // ============================================================
   std::vector<StageStats> stats;
   int frame_count = 0;
@@ -330,9 +330,7 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    // ---- 4.3 零拷贝链路：mmap 后的 dst_ptr -> Hailo input_ptr ----
-    // （Hailo SDK 目前只支持 CPU 指针输入，因此需要一次 memcpy）
-    std::memcpy(det.input_ptr(), dst_ptr, cropper.dst_size());
+    // ---- 4.3 RGA output mapped directly as Hailo input (zero-copy) ----
     auto t3 = std::chrono::steady_clock::now();
     s.copy_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 

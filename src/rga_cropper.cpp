@@ -58,12 +58,12 @@ RgaCropper::~RgaCropper() {
 }
 
 bool RgaCropper::alloc_dma_buf(size_t size) {
-    int heap_fd = open("/dev/dma_heap/system-uncached", O_RDWR | O_CLOEXEC);
+    int heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
     if (heap_fd < 0) {
-        RGA_ERR("open system-uncached failed: " << strerror(errno) << ", fallback to system");
-        heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+        RGA_ERR("open system failed: " << strerror(errno) << ", fallback to system-uncached");
+        heap_fd = open("/dev/dma_heap/system-uncached", O_RDWR | O_CLOEXEC);
         if (heap_fd < 0) {
-            RGA_ERR("open system failed: " << strerror(errno));
+            RGA_ERR("open system-uncached failed: " << strerror(errno));
             return false;
         }
     }

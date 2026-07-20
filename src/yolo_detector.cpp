@@ -160,6 +160,16 @@ size_t YoloDetector::input_bytes() const {
   return single_frame_size_ * batch_size_;
 }
 
+void YoloDetector::set_input_buffer(uint8_t *ext_ptr) {
+  if (!ext_ptr || !configured_model_) return;
+  input_buf_ = std::shared_ptr<uint8_t>(ext_ptr, [](uint8_t *) {});
+  for (uint16_t b = 0; b < batch_size_; ++b) {
+    bindings_vec_[b].input(input_name_)
+        ->set_buffer(hailort::MemoryView(
+            ext_ptr + b * single_frame_size_, single_frame_size_));
+  }
+}
+
 int YoloDetector::input_width() const { return nn_w_; }
 int YoloDetector::input_height() const { return nn_h_; }
 uint16_t YoloDetector::batch_size() const { return batch_size_; }

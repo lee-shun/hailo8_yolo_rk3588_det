@@ -17,6 +17,7 @@ public:
             uint16_t batch_size = 1);
   uint8_t *input_ptr() const;
   size_t input_bytes() const;
+  void set_input_buffer(uint8_t *ext_ptr);
   int input_width() const;
   int input_height() const;
   uint16_t batch_size() const;
