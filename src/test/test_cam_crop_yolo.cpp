@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <opencv2/opencv.hpp>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -44,8 +45,64 @@ static void print_usage(const char *prog) {
       << "  -y, --overlap-h <n>    Vertical overlap (default: auto)\n"
       << "  -o, --output <dir>     Output dir for saved tiles (default: ./output)\n"
       << "  --save                 Save tiles once after warmup\n"
+      << "  --save-det <n>         Save detection images every N frames (0=off)\n"
       << "  -h, --help             Show this help\n";
 }
+
+// ==================== Cross-Region NMS ====================
+
+static float compute_iou(const Detection &a, const Detection &b) {
+  float x1 = std::max(a.x, b.x);
+  float y1 = std::max(a.y, b.y);
+  float x2 = std::min(a.x + a.w, b.x + b.w);
+  float y2 = std::min(a.y + a.h, b.y + b.h);
+  if (x2 <= x1 || y2 <= y1) return 0.0f;
+  float inter = (x2 - x1) * (y2 - y1);
+  float area_a = a.w * a.h;
+  float area_b = b.w * b.h;
+  return inter / (area_a + area_b - inter + 1e-6f);
+}
+
+static std::vector<Detection> cross_region_nms(
+    const std::vector<std::vector<Detection>> &all_tile_dets,
+    int tile_cols, int /*tile_rows*/, int tile_w, int tile_h,
+    int overlap_w, int overlap_h, float iou_thresh) {
+  int step_x = tile_w - overlap_w;
+  int step_y = tile_h - overlap_h;
+  std::vector<Detection> global;
+  for (int i = 0; i < (int)all_tile_dets.size(); ++i) {
+    int row = i / tile_cols;
+    int col = i % tile_cols;
+    float offset_x = (float)(col * step_x);
+    float offset_y = (float)(row * step_y);
+    for (const auto &det : all_tile_dets[i]) {
+      Detection g;
+      g.x = det.x + offset_x;
+      g.y = det.y + offset_y;
+      g.w = det.w;
+      g.h = det.h;
+      g.score = det.score;
+      g.cls = det.cls;
+      global.push_back(g);
+    }
+  }
+  std::sort(global.begin(), global.end(),
+            [](const Detection &a, const Detection &b) { return a.score > b.score; });
+  std::vector<Detection> kept;
+  for (const auto &det : global) {
+    bool suppress = false;
+    for (const auto &k : kept) {
+      if (compute_iou(det, k) > iou_thresh) {
+        suppress = true;
+        break;
+      }
+    }
+    if (!suppress) kept.push_back(det);
+  }
+  return kept;
+}
+
+// ===============================================================
 
 int main(int argc, char **argv) {
   std::signal(SIGINT, sig_handler);
@@ -63,6 +120,7 @@ int main(int argc, char **argv) {
   int overlap_w = -1, overlap_h = -1; // -1 = auto
   std::string output_dir = "./output";
   bool save_tiles = false;
+  int save_det_interval = 0;
 
   static struct option long_opts[] = {
       {"dev", required_argument, 0, 'd'},
@@ -83,12 +141,13 @@ int main(int argc, char **argv) {
       {"overlap-h", required_argument, 0, 'y'},
       {"output", required_argument, 0, 'o'},
       {"save", no_argument, 0, 's'},
+      {"save-det", required_argument, 0, 'S'},
       {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
 
   int c, opt_idx = 0;
   while ((c = getopt_long(argc, argv,
-                          "d:W:H:f:m:c:i:b:l:w:t:u:C:R:x:y:o:sh",
+                          "d:W:H:f:m:c:i:b:l:w:t:u:C:R:x:y:o:sS:h",
                           long_opts, &opt_idx)) != -1) {
     switch (c) {
       case 'd': dev = optarg; break;
@@ -109,6 +168,7 @@ int main(int argc, char **argv) {
       case 'y': overlap_h = atoi(optarg); break;
       case 'o': output_dir = optarg; break;
       case 's': save_tiles = true; break;
+      case 'S': save_det_interval = atoi(optarg); break;
       case 'h': print_usage(argv[0]); return 0;
       default: print_usage(argv[0]); return 1;
     }
@@ -218,6 +278,7 @@ int main(int argc, char **argv) {
   bool saved = false;
   auto t_start = std::chrono::steady_clock::now();
 
+  cv::Mat save_bgr;
   while (g_running) {
     if (loop > 0 && frame_count >= loop + warmup) break;
 
@@ -242,6 +303,26 @@ int main(int argc, char **argv) {
     s.rga_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
     // RGA 完成后立即归还 V4L2 buffer（不阻塞后续 Hailo 推理）
+    bool save_this_frame = (save_det_interval > 0 && frame_count >= warmup &&
+                             (frame_count - warmup + 1) % save_det_interval == 0);
+    if (save_this_frame) {
+      uint8_t *yuyv_mmap = nullptr;
+      size_t yuyv_mmap_sz = 0;
+      uint8_t *yuyv_raw = cam.src_ptr();
+      if (yuyv_raw) {
+        cv::Mat yuyv(cam.src_h(), cam.src_w(), CV_8UC2, yuyv_raw, cam.src_stride());
+        cv::cvtColor(yuyv, save_bgr, cv::COLOR_YUV2BGR_YUYV);
+      } else if (cam.src_fd() >= 0) {
+        yuyv_mmap_sz = (size_t)cam.src_stride() * cam.src_h();
+        yuyv_mmap = (uint8_t *)mmap(nullptr, yuyv_mmap_sz, PROT_READ, MAP_SHARED,
+                                    cam.src_fd(), 0);
+        if (yuyv_mmap != MAP_FAILED) {
+          cv::Mat yuyv(cam.src_h(), cam.src_w(), CV_8UC2, yuyv_mmap, cam.src_stride());
+          cv::cvtColor(yuyv, save_bgr, cv::COLOR_YUV2BGR_YUYV);
+        }
+      }
+      if (yuyv_mmap && yuyv_mmap != MAP_FAILED) munmap(yuyv_mmap, yuyv_mmap_sz);
+    }
     cam.release();
 
     if (!rga_ok) {
@@ -260,6 +341,41 @@ int main(int argc, char **argv) {
     auto t4 = std::chrono::steady_clock::now();
     s.infer_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
 
+    // ---- 4.5 Cross-Region NMS ----
+    auto merged_dets = cross_region_nms(all_dets, tile_cols, tile_rows,
+                                        tile_w, tile_h, overlap_w, overlap_h, iou);
+
+    // ---- 4.6 Draw & Save (only frames with detections) ----
+    if (save_this_frame && !save_bgr.empty() && !merged_dets.empty()) {
+      for (const auto &d : merged_dets) {
+        cv::Scalar blue(255, 0, 0);
+        cv::Scalar white(255, 255, 255);
+        cv::rectangle(save_bgr, cv::Point((int)d.x, (int)d.y),
+                      cv::Point((int)(d.x + d.w), (int)(d.y + d.h)), blue, 2);
+        std::string label = cv::format("%.2f", d.score);
+        int baseline = 0;
+        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+        cv::Rect bg((int)d.x, (int)d.y - ts.height - 4, ts.width + 8, ts.height + 4);
+        cv::rectangle(save_bgr, bg, blue, -1);
+        cv::putText(save_bgr, label, cv::Point((int)d.x + 4, (int)d.y - 2),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, white, 1, cv::LINE_AA);
+      }
+      std::string timing = cv::format(
+          "grab:%.1f rga:%.1f copy:%.1f infer:%.1f total:%.1f ms",
+          s.grab_ms, s.rga_ms, s.copy_ms, s.infer_ms, s.total_ms);
+      int baseline = 0;
+      cv::Size ts = cv::getTextSize(timing, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
+      cv::rectangle(save_bgr, cv::Point(0, 0), cv::Point(ts.width + 8, ts.height + 8),
+                    cv::Scalar(0, 0, 0), -1);
+      cv::putText(save_bgr, timing, cv::Point(4, ts.height + 4),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+      std::string save_path = output_dir + "/det_" +
+          std::to_string(frame_count - warmup) + ".jpg";
+      cv::imwrite(save_path, save_bgr);
+      std::cout << "[Test] >>> Saved detection image: " << save_path << " ("
+                << merged_dets.size() << " dets)\n";
+    }
+
     s.total_ms = std::chrono::duration<double, std::milli>(t4 - t0).count();
     frame_count++;
 
@@ -272,6 +388,7 @@ int main(int argc, char **argv) {
       for (size_t b = 0; b < all_dets.size(); ++b) {
         det_counts += "b" + std::to_string(b) + ":" + std::to_string(all_dets[b].size()) + " ";
       }
+      det_counts += "merged:" + std::to_string(merged_dets.size());
 
       std::cout << "[Test] Frame " << std::setw(4) << (frame_count - warmup)
                 << " | grab=" << std::fixed << std::setprecision(2) << s.grab_ms
