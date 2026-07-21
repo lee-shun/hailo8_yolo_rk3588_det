@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "utility_tool/step_timer.h"
+
 static volatile bool g_running = true;
 static void sig_handler(int) { g_running = false; }
 
@@ -278,6 +280,8 @@ int main(int argc, char **argv) {
   bool saved = false;
   auto t_start = std::chrono::steady_clock::now();
 
+  TIMER_TEST_BEGIN(pipeline);
+
   cv::Mat save_bgr;
   while (g_running) {
     if (loop > 0 && frame_count >= loop + warmup) break;
@@ -286,9 +290,12 @@ int main(int argc, char **argv) {
     auto t0 = std::chrono::steady_clock::now();
 
     // ---- 4.1 抓图 ----
+    TIMER_STEP_START(pipeline, grab);
     if (!cam.grab()) {
       continue;
     }
+    TIMER_STEP_END(pipeline, grab);
+
     auto t1 = std::chrono::steady_clock::now();
     s.grab_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -298,7 +305,9 @@ int main(int argc, char **argv) {
     int src_h = cam.src_h();
 
     // ---- 4.2 RGA 色转 + Crop + 拼接（异步提交，job API）----
+    TIMER_STEP_START(pipeline, rga_submit);
     bool rga_ok = cropper.process_async(src_fd, src_fmt, src_w, src_h, false);
+    TIMER_STEP_END(pipeline, rga_submit);
     auto t2 = std::chrono::steady_clock::now();
 
     // RGA job 已提交，归还 V4L2 buffer
@@ -322,6 +331,7 @@ int main(int argc, char **argv) {
       }
       if (yuyv_mmap && yuyv_mmap != MAP_FAILED) munmap(yuyv_mmap, yuyv_mmap_sz);
     }
+
     cam.release();
 
     if (!rga_ok) {
@@ -331,10 +341,12 @@ int main(int argc, char **argv) {
 
     // 等待 RGA job 完成
     auto t2b = std::chrono::steady_clock::now();
+    TIMER_STEP_START(pipeline, rga_wait);
     if (!cropper.wait_fence()) {
       std::cerr << "[Test] ERROR: RGA wait failed\n";
       continue;
     }
+    TIMER_STEP_END(pipeline, rga_wait);
     auto t3 = std::chrono::steady_clock::now();
 
     // rga_ms = submit + wait 的总 RGA 耗时
@@ -342,13 +354,19 @@ int main(int argc, char **argv) {
     s.copy_ms = std::chrono::duration<double, std::milli>(t3 - t2b).count();
 
     // ---- 4.4 Hailo 推理 + 解析全部 batch ----
+    TIMER_STEP_START(pipeline, infer);
     auto all_dets = det.infer_all();
+    TIMER_STEP_END(pipeline, infer);
     auto t4 = std::chrono::steady_clock::now();
     s.infer_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
 
     // ---- 4.5 Cross-Region NMS ----
+    TIMER_STEP_START(pipeline, cross_nms);
     auto merged_dets = cross_region_nms(all_dets, tile_cols, tile_rows,
                                         tile_w, tile_h, overlap_w, overlap_h, iou);
+    TIMER_STEP_END(pipeline, cross_nms);
+
+    TIMER_TEST_PEEK(pipeline);
 
     // ---- 4.6 Draw & Save (only frames with detections) ----
     if (save_this_frame && !save_bgr.empty() && !merged_dets.empty()) {
@@ -457,6 +475,8 @@ int main(int argc, char **argv) {
               << "[Test] Theoretical FPS  : " << (1000.0 / avg_total) << "\n"
               << "[Test] =========================================================\n";
   }
+
+  TIMER_TEST_END(pipeline);
 
   munmap(dst_ptr, cropper.dst_size());
   return 0;
