@@ -297,12 +297,11 @@ int main(int argc, char **argv) {
     int src_w = cam.src_w();
     int src_h = cam.src_h();
 
-    // ---- 4.2 RGA 色转 + Crop + 拼接 ----
-    bool rga_ok = cropper.process(src_fd, src_fmt, src_w, src_h);
+    // ---- 4.2 RGA 色转 + Crop + 拼接（异步提交，job API）----
+    bool rga_ok = cropper.process_async(src_fd, src_fmt, src_w, src_h, false);
     auto t2 = std::chrono::steady_clock::now();
-    s.rga_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
-    // RGA 完成后立即归还 V4L2 buffer（不阻塞后续 Hailo 推理）
+    // RGA job 已提交，归还 V4L2 buffer
     bool save_this_frame = (save_det_interval > 0 && frame_count >= warmup &&
                              (frame_count - warmup + 1) % save_det_interval == 0);
     if (save_this_frame) {
@@ -326,13 +325,21 @@ int main(int argc, char **argv) {
     cam.release();
 
     if (!rga_ok) {
-      std::cerr << "[Test] ERROR: RGA process failed\n";
+      std::cerr << "[Test] ERROR: RGA async submit failed\n";
       continue;
     }
 
-    // ---- 4.3 RGA output mapped directly as Hailo input (zero-copy) ----
+    // 等待 RGA job 完成
+    auto t2b = std::chrono::steady_clock::now();
+    if (!cropper.wait_fence()) {
+      std::cerr << "[Test] ERROR: RGA wait failed\n";
+      continue;
+    }
     auto t3 = std::chrono::steady_clock::now();
-    s.copy_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    // rga_ms = submit + wait 的总 RGA 耗时
+    s.rga_ms = std::chrono::duration<double, std::milli>(t3 - t1).count();
+    s.copy_ms = std::chrono::duration<double, std::milli>(t3 - t2b).count();
 
     // ---- 4.4 Hailo 推理 + 解析全部 batch ----
     auto all_dets = det.infer_all();

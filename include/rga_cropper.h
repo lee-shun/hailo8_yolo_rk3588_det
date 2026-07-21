@@ -20,6 +20,17 @@ public:
   bool init();
   bool process(int src_fd, int src_fmt, int src_w, int src_h);
 
+  // 异步提交（sync=false），返回 release_fence_fd 放入 sync_fence_
+  // acquire_fence_fd: RGA 开始前等待的外部 fence（默认 -1 不等待）
+  bool process_async(int src_fd, int src_fmt, int src_w, int src_h,
+                     bool sync, int acquire_fence_fd = -1);
+
+  int sync_fence() const;
+
+  // 等待异步 RGA job 完成，调用 imsync() + close(fence)
+  // 返回 true 表示 job 成功完成
+  bool wait_fence();
+
   int dst_fd() const { return dst_fd_; }
   size_t dst_size() const { return dst_size_; }
   int tile_w() const { return tile_w_; }
@@ -38,12 +49,13 @@ private:
   int overlap_w_, overlap_h_;
   int dst_fd_ = -1;
   size_t dst_size_ = 0;
+  std::vector<int> async_fences_;
   std::vector<im_rect> src_rects_;
 
   bool alloc_dma_buf(size_t size);
   void release_dma_buf();
   static bool save_bmp(const std::string &path, const uint8_t *rgb_data, int w,
-                       int h);
+                        int h);
 };
 
 #endif

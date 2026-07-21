@@ -120,6 +120,7 @@ bool RgaCropper::process(int src_fd, int src_fmt, int src_w, int src_h) {
     rga_buffer_t pat = {};
     memset(&pat, 0, sizeof(pat));
 
+    // 每个 tile 单独同步提交（保持原有兼容性）
     for (size_t i = 0; i < src_rects_.size(); ++i) {
         im_rect dst_rect = {0, (int)(i * tile_h_), tile_w_, tile_h_};
 
@@ -133,6 +134,84 @@ bool RgaCropper::process(int src_fd, int src_fmt, int src_w, int src_h) {
     }
 
     return true;
+}
+
+bool RgaCropper::process_async(int src_fd, int src_fmt, int src_w, int src_h,
+                                bool sync, int acquire_fence_fd) {
+    if (dst_fd_ < 0) {
+        RGA_ERR("dst_fd not ready, call init() first");
+        return false;
+    }
+
+    rga_buffer_t src = wrapbuffer_fd(src_fd, src_w, src_h, src_fmt, src_w, src_h);
+    src.vir_addr = nullptr;
+    src.phy_addr = nullptr;
+
+    int dst_total_h = tile_h_ * tile_count();
+    rga_buffer_t dst = wrapbuffer_fd(dst_fd_, tile_w_, dst_total_h,
+                                      RK_FORMAT_RGB_888, tile_w_, dst_total_h);
+    dst.vir_addr = nullptr;
+    dst.phy_addr = nullptr;
+
+    rga_buffer_t pat = {};
+    memset(&pat, 0, sizeof(pat));
+
+    if (sync) {
+        for (size_t i = 0; i < src_rects_.size(); ++i) {
+            im_rect dst_rect = {0, (int)(i * tile_h_), tile_w_, tile_h_};
+            IM_STATUS ret = ::improcess(src, dst, pat,
+                                        src_rects_[i], dst_rect, {},
+                                        IM_SYNC);
+            if (ret != IM_STATUS_SUCCESS) {
+                RGA_ERR("improcess task " << i << " failed: " << imStrError(ret));
+                return false;
+            }
+        }
+    } else {
+        async_fences_.clear();
+        async_fences_.reserve(src_rects_.size());
+
+        for (size_t i = 0; i < src_rects_.size(); ++i) {
+            im_rect dst_rect = {0, (int)(i * tile_h_), tile_w_, tile_h_};
+            int fence = -1;
+            IM_STATUS ret = improcess(src, dst, pat,
+                                      src_rects_[i], dst_rect, {},
+                                      acquire_fence_fd >= 0 ? acquire_fence_fd : -1,
+                                      &fence,
+                                      nullptr, 0);
+            if (ret != IM_STATUS_SUCCESS) {
+                RGA_ERR("improcess async task " << i << " failed: " << imStrError(ret));
+                for (int f : async_fences_) close(f);
+                async_fences_.clear();
+                return false;
+            }
+            async_fences_.push_back(fence);
+        }
+    }
+
+    return true;
+}
+
+int RgaCropper::sync_fence() const {
+    if (async_fences_.empty()) return -1;
+    return async_fences_[0];
+}
+
+bool RgaCropper::wait_fence() {
+    if (async_fences_.empty()) return true;
+    bool ok = true;
+    for (int f : async_fences_) {
+        if (f >= 0) {
+            IM_STATUS ret = imsync(f);
+            close(f);
+            if (ret != IM_STATUS_SUCCESS) {
+                RGA_ERR("imsync failed: " << imStrError(ret));
+                ok = false;
+            }
+        }
+    }
+    async_fences_.clear();
+    return ok;
 }
 
 bool RgaCropper::save_bmp(const std::string& path, const uint8_t* rgb_data, int w, int h) {
